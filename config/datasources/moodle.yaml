@@ -23,7 +23,9 @@ fields:
   client_ip: "source.ip"
   status_code: "http.response.status_code"
   response_bytes: "http.response.body.bytes"
-  url_path: "url.path"
+  # On the live moodle indexes url.path is dynamically mapped as text
+  # (fielddata disabled), so aggregations must use the keyword subfield.
+  url_path: "url.path.keyword"
   url_query: "url.query"
   method: "http.request.method.keyword"
   referrer: "http.request.referrer.keyword"
