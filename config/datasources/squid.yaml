@@ -1,0 +1,25 @@
+# ===========================================================================
+# Datasource: Squid forward proxy (parsed by foss-soc-engine).
+# ===========================================================================
+name: squid
+label: "Internet Gateway (Squid Forward Proxy)"
+profile: proxy
+index: "fosstlsoc-logs-squid*"
+
+fields:
+  timestamp: "@timestamp"
+  client_ip: "source.ip"
+  client_port: "source.port"
+  dest_ip: "destination.ip"
+  dest_port: "destination.port"
+  bytes: "source.bytes"
+  duration_ms: "event.duration"
+  cache_action: "event.action"
+  outcome: "event.outcome"
+  status_code: "http.response.status_code"
+  method: "http.request.method"
+  protocol: "network.protocol"
+  proxy_host: "host.name"
+  original_destination: "squid.original_destination"
+
+params: {}

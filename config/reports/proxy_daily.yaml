@@ -1,0 +1,308 @@
+# ===========================================================================
+# REPORT: Daily Forward-Proxy Traffic  (profile: proxy -> squid et al.)
+# ===========================================================================
+name: proxy_daily
+title: "Daily Proxy Traffic & Security Report"
+profile: proxy
+description: >
+  Executive daily report for forward-proxy logs: client usage, destinations,
+  denied requests, tunnel activity and bandwidth.
+
+_defs:
+  denied: &denied
+    any:
+      - {field: cache_action, wildcard: "*denied*"}
+      - {field: status_code, in: [403, 407]}
+
+params:
+  window_hours: 24
+  top_n: 10
+  denied_rate_warn: 2.0
+  denied_rate_crit: 10.0
+  prev_window_min_ratio: 0.5
+  # Ports that are NOT plain web browsing - worth an analyst's glance when
+  # they show up through the proxy.
+  unusual_ports: [22, 23, 25, 445, 3389, 5900, 1080, 4444, 6667, 9001,
+                  9050]
+
+queries:
+  total_requests: {kind: count}
+  unique_clients: {kind: cardinality, field: client_ip}
+  total_bytes: {kind: sum, field: bytes}
+  denied_total: {kind: count, filter: *denied}
+
+  hourly:
+    kind: date_histogram
+    interval: hour
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+
+  hourly_denied:
+    kind: date_histogram
+    interval: hour
+    filter: *denied
+
+  top_clients:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    sub_aggs:
+      bytes: {kind: sum, field: bytes}
+      dests: {kind: cardinality, field: dest_ip}
+      denied: {kind: filter, filter: *denied}
+    transforms:
+      - classify_ip: {}
+      - derive_pct: {num: denied, den: count, to: denied_pct}
+
+  top_destinations:
+    kind: terms
+    field: dest_ip
+    size: $top_n
+    sub_aggs:
+      bytes: {kind: sum, field: bytes}
+      clients: {kind: cardinality, field: client_ip}
+
+  bandwidth_clients:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    order_by: bytes
+    sub_aggs:
+      bytes: {kind: sum, field: bytes}
+    transforms:
+      - classify_ip: {}
+
+  dest_ports:
+    kind: terms
+    field: dest_port
+    size: $top_n
+    optional: true
+
+  unusual_port_traffic:
+    kind: terms
+    field: dest_port
+    size: 10
+    optional: true
+    filter: {field: dest_port, in_param: unusual_ports}
+    sub_aggs:
+      clients: {kind: top_terms, field: client_ip, size: 3}
+      dests: {kind: top_terms, field: dest_ip, size: 3}
+
+  cache_actions: {kind: terms, field: cache_action, size: 10,
+                  optional: true}
+  status_codes: {kind: terms, field: status_code, size: $top_n}
+
+  denied_clients:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    filter: *denied
+    sub_aggs:
+      dests: {kind: top_terms, field: dest_ip, size: 2}
+    transforms:
+      - classify_ip: {}
+
+  prev_total: {kind: count, window: previous}
+
+computed:
+  - {name: total, expr: "q.total_requests or 0"}
+  - {name: denied, expr: "q.denied_total or 0"}
+  - {name: denied_rate, expr: "pct(c.denied, c.total)"}
+  - name: prev_reliable
+    expr: "(q.prev_total or 0) >= c.total * params.prev_window_min_ratio
+           and (q.prev_total or 0) > 0"
+  - name: delta_requests
+    expr: "delta_pct(c.total, q.prev_total) if c.prev_reliable else None"
+  - name: data_warning
+    expr: "None if c.prev_reliable or c.total == 0 else
+           'Previous window logged only ' ~ human_int(q.prev_total) ~
+           ' requests against ' ~ human_int(c.total) ~ ' now — trend
+           comparison suppressed (likely ingest gap).'"
+
+badges:
+  - id: policy
+    label: "Policy posture"
+    levels:
+      - {when: "c.denied_rate >= params.denied_rate_crit",
+         text: ELEVATED, color: red}
+      - {when: "c.denied_rate >= params.denied_rate_warn",
+         text: WATCH, color: amber}
+      - {text: ROUTINE, color: green}
+
+insights:
+  - when: "c.total == 0"
+    stop: true
+    text: >
+      No proxy traffic was recorded in the reporting window. Verify the log
+      pipeline and that {{ ds.index }} is receiving documents.
+
+  - text: >
+      {{ human_int(c.total) }} proxied requests from
+      {{ human_int(q.unique_clients) }} client hosts, moving
+      {{ human_bytes(q.total_bytes) }}
+      {%- if c.delta_requests is not none %}
+      ({{ "▲" if c.delta_requests > 0 else "▼" }}
+      {{ "%.1f" | format(c.delta_requests | abs) }}% vs previous
+      {{ window.hours }}h){% endif %}.
+
+  - when: "c.denied > 0"
+    text: >
+      {{ human_int(c.denied) }} requests
+      ({{ "%.2f" | format(c.denied_rate) }}%) were denied by proxy policy.
+      The clients generating denials are listed under Policy & Denials.
+
+  - when: "c.denied == 0"
+    text: "No requests were denied by proxy policy in this window."
+
+  - when: "q.top_clients"
+    text: >
+      The most active client was {{ q.top_clients[0].key }}
+      ({{ q.top_clients[0].location }}) with
+      {{ human_int(q.top_clients[0].count) }} requests to
+      {{ human_int(q.top_clients[0].dests) }} distinct destinations.
+
+  - when: "q.bandwidth_clients"
+    text: >
+      The heaviest downloader was {{ q.bandwidth_clients[0].key }} with
+      {{ human_bytes(q.bandwidth_clients[0].bytes) }} transferred.
+
+  - when: "q.unusual_port_traffic"
+    text: >
+      Traffic to non-web ports was observed:
+      {% for r in q.unusual_port_traffic[:4] %}port {{ r.key }}
+      ({{ human_int(r.count) }} requests){{ ", " if not loop.last }}
+      {%- endfor %}. Review the Unusual Destination Ports table.
+
+  - when: "q.hourly"
+    text: >
+      {% set peak = q.hourly | max(attribute='count') %}
+      Proxy usage peaked around {{ peak.label }} {{ window.tz_label }}
+      with {{ human_int(peak.count) }} requests in the hour.
+
+actions:
+  - when: "q.unusual_port_traffic"
+    priority: P2
+    owner: "SOC"
+    text: >
+      Non-web destination ports were reached through the proxy
+      ({{ q.unusual_port_traffic | map(attribute='key') | join(', ') }}).
+      Confirm each is sanctioned; tunnels to such ports are a common
+      exfiltration / C2 pattern.
+
+  - when: "q.denied_clients and q.denied_clients[0].count >= 100"
+    priority: P3
+    owner: "SOC"
+    text: >
+      Client {{ q.denied_clients[0].key }} generated
+      {{ human_int(q.denied_clients[0].count) }} policy denials —
+      repeated denials usually mean misconfigured software or a user
+      probing the policy. Identify the host owner.
+
+  - when: "c.denied_rate >= params.denied_rate_warn"
+    priority: P3
+    owner: "Network team"
+    text: >
+      Overall denial rate is {{ "%.2f" | format(c.denied_rate) }}%.
+      If this is new, check whether a policy change or a block-list update
+      is over-matching legitimate destinations.
+
+sections:
+  - {type: heading, title: "Executive summary"}
+  - {type: insights}
+
+  - type: kpi_row
+    items:
+      - {label: "Proxied requests", value: "c.total", format: int,
+         delta: "c.delta_requests"}
+      - {label: "Client hosts", value: "q.unique_clients", format: int}
+      - {label: "Data transferred", value: "q.total_bytes", format: bytes}
+      - {label: "Policy denials", value: "c.denied", format: int,
+         style: "'crit' if c.denied_rate >= params.denied_rate_crit else
+                 ('warn' if c.denied_rate >= params.denied_rate_warn
+                 else 'ok')",
+         foot: "{{ '%.2f' | format(c.denied_rate) }}% of requests"}
+
+  - {type: heading, title: "Usage"}
+  - type: timeseries
+    title: "Requests per hour"
+    query: hourly
+    overlay: hourly_denied
+    series_label: "requests / hour"
+    overlay_label: "denied requests"
+
+  - type: table
+    title: "Top clients"
+    query: top_clients
+    columns:
+      - {key: key, label: "Client IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: count, label: "Requests", format: int}
+      - {key: dests, label: "Destinations", format: int}
+      - {key: denied_pct, label: "Denied %", format: pct}
+      - {key: bytes, label: "Bandwidth", format: bytes}
+
+  - type: row
+    left:
+      type: table
+      title: "Top destinations"
+      query: top_destinations
+      columns:
+        - {key: key, label: "Destination", format: mono, max: 22}
+        - {key: count, label: "Requests", format: int}
+        - {key: bytes, label: "Bytes", format: bytes}
+    right:
+      type: table
+      title: "Bandwidth by client"
+      query: bandwidth_clients
+      columns:
+        - {key: key, label: "Client", format: mono, width: 100, nowrap: true}
+        - {key: count, label: "Requests", format: int}
+        - {key: bytes, label: "Bytes", format: bytes}
+
+  - type: row
+    left:
+      type: bars
+      title: "Destination ports"
+      query: dest_ports
+      color: navy
+      show_pct: true
+    right:
+      type: bars
+      title: "Cache / tunnel actions"
+      query: cache_actions
+      color: teal
+      show_pct: true
+
+  - {type: heading, title: "Policy & denials"}
+  - type: table
+    title: "Unusual destination ports (non-web)"
+    query: unusual_port_traffic
+    hide_if_empty: true
+    note: "Tunnels to non-web ports through a browsing proxy deserve a
+           second look — common exfiltration / C2 pattern."
+    columns:
+      - {key: key, label: "Port"}
+      - {key: count, label: "Requests", format: int}
+      - {key: clients, label: "Top clients", format: mono, max: 40}
+      - {key: dests, label: "Top destinations", format: mono, max: 40}
+
+  - type: table
+    title: "Clients with policy denials"
+    query: denied_clients
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Client IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: count, label: "Denials", format: int}
+      - {key: dests, label: "Attempted destinations", format: mono,
+         max: 40}
+
+  - type: bars
+    title: "Status codes"
+    query: status_codes
+    color: blue
+
+  - {type: heading, title: "Recommended actions"}
+  - {type: actions}
