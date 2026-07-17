@@ -104,11 +104,10 @@ deployment → built-in defaults.
 ```bash
 python3 -m framework list       # datasources, reports, runnable pairs
 python3 -m framework validate   # compile-check everything, no ES needed
-
-# full render with ZERO infrastructure - proves the install end to end:
-python3 -m framework generate --report web_daily --datasource moodle \
-    --backend local --sample log_samples/moodleapplication_sample.json
 ```
+
+With a local sample file (see *Offline preview* below) you can also
+prove the full render pipeline with zero infrastructure.
 
 ## Usage
 
@@ -132,11 +131,15 @@ Reports land in `output/html/` and `output/pdf/` as
 ### Offline preview (no Elasticsearch)
 
 Develop templates and queries against a sample file — the same query
-engine runs over the file, so output is identical to a live run:
+engine runs over the file, so output is identical to a live run. A
+sample is any NDJSON file (one parsed JSON log document per line, as the
+parsing engine emits). Samples are **not shipped in the repo** — they
+are real log data; keep them in a local, git-ignored `log_samples/`
+directory:
 
 ```bash
 python3 -m framework generate --report web_daily --datasource moodle \
-        --backend local --sample log_samples/moodleapplication_sample.json
+        --backend local --sample log_samples/moodle_sample.json
 ```
 
 ## Automation (daily reports + logging)
@@ -265,7 +268,7 @@ insights). Estate-specific false positives go in that datasource's
 │   └── pdf.py              #   wkhtmltopdf -> chrome -> weasyprint fallback
 ├── config/                 # everything you edit day-to-day
 ├── templates/framework/    # page chrome + one partial per widget
-├── log_samples/            # sample NDJSON logs for offline preview/testing
+├── log_samples/            # local-only NDJSON samples (git-ignored)
 ├── scripts/                # automation (cron wrapper with logging)
 ├── output/{html,pdf}/      # generated reports (git-ignored)
 └── logs/                   # automation logs (git-ignored)
@@ -276,8 +279,6 @@ insights). Estate-specific false positives go in that datasource's
 - The Elasticsearch password comes **only** from the environment
   (`TLSOC_ES_PASS`, usually via the git-ignored `.env`). Nothing secret is
   committed.
-- Generated reports are git-ignored (`output/`) — they contain real
-  traffic data and must never be committed.
-- `log_samples/` can contain internal IPs, hostnames and email
-  addresses. Keep the repo **private**, or replace the samples with
-  anonymised data before making it public.
+- Generated reports (`output/`) and sample logs (`log_samples/`) are
+  git-ignored: both contain real traffic data — internal IPs, hostnames,
+  email addresses — and must never be committed.

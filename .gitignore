@@ -6,6 +6,9 @@ __pycache__/
 # Secrets / local environment
 .env
 
+# Real log data must never be committed - keep local samples untracked
+log_samples/
+
 # Generated artifacts (reports are rebuilt daily; never commit data)
 output/html/*
 output/pdf/*
