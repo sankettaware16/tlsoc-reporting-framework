@@ -1,0 +1,171 @@
+# ===========================================================================
+# Signature pack: web attack / probe patterns.
+#
+# Shared by every web_access report. Patterns are Elasticsearch wildcards
+# evaluated CASE-INSENSITIVELY against the pack's target field. They are
+# deliberately anchored to the real artefact being probed
+# (e.g. "*/vendor/phpunit/*", never a loose "/vendor/") so first-party
+# application assets never match. Estate-specific allowlisting happens in
+# the report params (benign_path_prefixes / static_asset_suffixes) and the
+# datasource's extra_benign_path_prefixes - NOT here.
+#
+# severity: critical -> hands-on exploitation attempt; page an analyst if
+#                       it was answered with 2xx
+#           high     -> targeted secret / credential hunting
+#           medium   -> commodity internet background scanning
+#
+# Adding a category = adding YAML. Every report that uses this pack picks
+# it up automatically (tables, totals, badges, insights).
+# ===========================================================================
+name: web_threats
+target_field: url_path
+
+categories:
+  rce:
+    title: "Remote code execution / exploit chains"
+    severity: critical
+    why: "Requests matching public exploit paths for PHP, Java and
+          network-appliance CVEs."
+    patterns:
+      - "*eval-stdin.php*"
+      - "*/vendor/phpunit/*"
+      - "*/phpunit/src/util/php*"
+      - "*/struts*"
+      - "*.action"
+      - "*/actuator/gateway/routes*"
+      - "*/actuator/env*"
+      - "*/console/j_security_check*"
+      - "*/boaform/*"
+      - "*/hnap1*"
+      - "*/goform/*"
+      - "*/setup.php"
+      - "*invokefunction*"
+      - "*/think/app/*"
+      - "*/index.php?s=/index/*"
+      - "*/remote/fgt_lang*"
+      - "*/dana-na/*"
+      - "*/global-protect/login*"
+      - "*/cgi-bin/luci*"
+      - "*/cgi-bin/mainfunction.cgi*"
+      # ProxyLogon markers. /autodiscover/autodiscover.xml is deliberately
+      # NOT here: on anything but Exchange it is ordinary Outlook mail
+      # autodiscovery and produces phantom criticals. x.js / y.js are the
+      # parts of the chain that are never benign.
+      - "*/owa/auth/x.js*"
+      - "*/ecp/y.js*"
+      - "*/_ignition/execute-solution*"
+      - "*/api/jsonws/invoke*"
+      - "*/solr/admin/info/system*"
+      - "*/telerik.web.ui*"
+      - "*/hybridaction/zuoqi*"
+
+  traversal_injection:
+    title: "Traversal / injection attempts"
+    severity: critical
+    why: "Encoded traversal, null bytes, SQLi/XSS or JNDI markers in the
+          request path."
+    patterns:
+      - "*..%2f*"
+      - "*..%252f*"
+      - "*..%c0%af*"
+      - "*../../*"
+      - "*/etc/passwd*"
+      - "*/etc/shadow*"
+      - "*/proc/self/environ*"
+      - "*%00*"
+      - "*<script*"
+      - "*union+select*"
+      - "*union%20select*"
+      - "*${jndi:*"
+      - "*{{*}}*"
+      - "*/bin/sh*"
+      - "*|*"
+      - "*`*"
+
+  webshell:
+    title: "Web shell / backdoor probes"
+    severity: critical
+    why: "Looking for shells previously dropped on the host."
+    patterns:
+      - "*/shell.php*"
+      - "*/cmd.php*"
+      - "*/wso.php*"
+      - "*/c99.php*"
+      - "*/r57.php*"
+      - "*/alfa.php*"
+      - "*webshell*"
+      - "*/1.php"
+      - "*/uploads/*.php*"
+      - "*/tmp/*.php*"
+      - "*/backdoor*"
+
+  secrets:
+    title: "Secret / config file access"
+    severity: high
+    why: "Attempts to read credentials, VCS metadata or backups that should
+          never be web-reachable."
+    patterns:
+      - "*/.env*"
+      - "*/.git/*"
+      - "*/.svn/*"
+      - "*/.hg/*"
+      - "*/.aws/*"
+      - "*/.ssh/*"
+      - "*/id_rsa*"
+      - "*/.htpasswd*"
+      - "*/.htaccess*"
+      - "*/web.config*"
+      - "*/configuration.php*"
+      - "*/config.php.bak*"
+      - "*/settings.php.bak*"
+      - "*/wp-config.php*"
+      - "*.sql"
+      - "*.bak"
+      - "*.old"
+      - "*/backup*.zip"
+      - "*/dump.sql*"
+      - "*/credentials*"
+      - "*/.npmrc*"
+      - "*/.dockercfg*"
+      - "*/docker-compose.yml*"
+
+  admin_consoles:
+    title: "Admin / management console discovery"
+    severity: medium
+    why: "Enumeration of database, container and app management UIs."
+    patterns:
+      - "*phpmyadmin*"
+      - "*/pma/*"
+      - "*/pmd/*"
+      - "*/adminer*"
+      - "*/administrator/index.php*"
+      - "*/manager/html*"
+      - "*/jenkins/login*"
+      - "*/hudson*"
+      - "*/druid/index.html*"
+      - "*/server-status*"
+      - "*/server-info*"
+      - "*/jmx-console*"
+      - "*/nagios/*"
+      - "*/zabbix*"
+      - "*/portainer*"
+      - "*/rundeck*"
+
+  foreign_cms:
+    title: "WordPress / foreign-CMS probes"
+    severity: medium
+    why: "Commodity WordPress scanning. Unsolicited on any estate that does
+          not run WordPress; if a site DOES run WordPress, allowlist its
+          paths in that datasource's extra_benign_path_prefixes."
+    patterns:
+      - "*/wp-login.php*"
+      - "*/wp-admin*"
+      - "*/xmlrpc.php*"
+      - "*/wp-content/plugins/*"
+      - "*/wp-content/themes/*"
+      - "*/wp-includes/*"
+      - "*/wp-json/wp/v2/users*"
+      - "*/wordpress/*"
+      - "*/wp/wp-*"
+      - "*/blog/wp-*"
+      - "*/old/wp-*"
