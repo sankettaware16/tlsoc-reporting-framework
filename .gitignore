@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets / local environment
+.env
+
+# Generated artifacts (reports are rebuilt daily; never commit data)
+output/html/*
+output/pdf/*
+!output/html/.gitkeep
+!output/pdf/.gitkeep
+
+# Automation logs
+logs/
+
+# Local archives / backups
+*.tar.gz
+
+# Unrelated project kept in the same working directory (not part of this repo)
+TLSOC_Report_Emailer/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

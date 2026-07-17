@@ -1,0 +1,10 @@
+# Core (required)
+elasticsearch>=8,<9
+jinja2>=3
+PyYAML>=6
+
+# PDF rendering needs ONE of these on the host (tried in this order):
+#   1. wkhtmltopdf binary        (what production uses; apt install wkhtmltopdf)
+#   2. google-chrome / chromium  (headless --print-to-pdf; most dev machines)
+#   3. weasyprint                (pure-python fallback: pip install weasyprint)
+# No python package is required for options 1 and 2.
