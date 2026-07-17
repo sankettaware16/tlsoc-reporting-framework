@@ -1,22 +1,27 @@
 # ===========================================================================
 # Instance settings - the ONLY file that knows about YOUR deployment.
-# Nothing in here is referenced by report definitions; move this file
-# between installations and every report keeps working.
 #
-# Secrets: DO NOT put the Elasticsearch password here. Set it in the
-# environment instead:
-#     export TLSOC_ES_PASS="..."
-# Every value below can also be overridden by env vars:
-#     TLSOC_ES_HOST, TLSOC_ES_USER, TLSOC_ES_PASS, TLSOC_ES_CA_CERT,
-#     TLSOC_OUTPUT_HTML_DIR, TLSOC_OUTPUT_PDF_DIR
+# ZERO-CONFIG on TLSOC hosts: if this machine runs the TLSOC docker stack
+# (default location /opt/TLSOCDockerDeploy), leave the elasticsearch block
+# exactly as it is. Host, password and CA certificate are auto-detected
+# from the deployment's own .env and certs/ - nothing to fill in.
+#
+# On any other machine, either fill the values below or export env vars:
+#     TLSOC_ES_HOST, TLSOC_ES_USER, TLSOC_ES_PASS, TLSOC_ES_CA_CERT
+# Secrets: NEVER commit a password here - use the env var / .env file.
 # ===========================================================================
 
 elasticsearch:
-  host: "https://YOUR-ELK-HOST:9200"
+  host: ""              # empty = auto-detect; else e.g. https://YOUR-ELK-HOST:9200
   user: "elastic"
-  password: ""                    # <- set TLSOC_ES_PASS instead
-  ca_cert: "/opt/TLSOCDockerDeploy/certs/ca/ca.crt"
+  password: ""          # empty = auto-detect; prefer TLSOC_ES_PASS env var
+  ca_cert: null         # null = auto-detect from <deploy dir>/certs/ca/ca.crt
   request_timeout: 120
+
+# Where the co-located TLSOC docker stack lives (used for auto-detection).
+tlsoc_deploy:
+  autodetect: true
+  dir: "/opt/TLSOCDockerDeploy"
 
 org:
   name: "IIT Bombay"
@@ -28,9 +33,9 @@ locale:
   tz_label: "IST"
 
 output:
-  # Default: reporting/output/{html,pdf}. Uncomment to redirect.
-  # html_dir: "/opt/TLSOCDockerDeploy/reporting/output/html"
-  # pdf_dir:  "/opt/TLSOCDockerDeploy/reporting/output/pdf"
+  # Default: <repo>/output/{html,pdf}. Uncomment to redirect.
+  # html_dir: "/srv/reports/html"
+  # pdf_dir:  "/srv/reports/pdf"
   formats: [html, pdf]
 
 pdf:
