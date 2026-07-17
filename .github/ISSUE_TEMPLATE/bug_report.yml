@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a defect in the reporting framework, a report definition, or the emailer
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Sanitize everything you paste** — replace real IPs,
+        hostnames, email addresses, and organization names with placeholders
+        (`203.0.113.10`, `user@example.com`, `example_org`). Never attach real log
+        data or generated reports.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Framework (queries / windows / transforms / rules)
+        - Rendering (HTML / charts / widgets)
+        - PDF generation
+        - A report or datasource definition (config/*.yaml)
+        - Signatures / detections
+        - Report Emailer
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: |
+        The exact command (e.g. `python3 -m framework generate --report web_daily
+        --datasource nginx`), plus — ideally — a minimal **sanitized** NDJSON sample
+        that reproduces it with `--backend local`.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, Elasticsearch version (or offline backend), PDF engine present.
+      placeholder: Ubuntu 22.04, Python 3.10, ES 8.19, wkhtmltopdf
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Sanitized excerpts from the run log (`logs/reports_<date>.log`) or the console.
+      render: text
+    validations:
+      required: false

@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a report type, query kind, widget, transform, or framework capability
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remember the golden rule: report logic is YAML, not Python. If your idea is
+        expressible as a new datasource, report, or signature pack, it may just need
+        documentation — say so and we'll figure it out together.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What story should a report tell that it can't today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        What should happen? For new query kinds/widgets/transforms, sketch the YAML
+        you'd want to write. Remember both backends (live ES + offline NDJSON) must
+        support it identically.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including "why existing query kinds / transforms / widgets don't cover this".
+    validations:
+      required: false
