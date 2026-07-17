@@ -1,0 +1,12 @@
+<div class="section">
+  {% if sec.title %}<h2>{{ sec.title }}{% if sec.hint %}<span class="hint">{{ sec.hint }}</span>{% endif %}</h2>{% endif %}
+  <table class="actions">
+    {% for a in sec["items"] %}
+    <tr>
+      <td class="prio {{ a.priority | lower }}">{{ a.priority }}</td>
+      <td class="owner">{{ a.owner }}</td>
+      <td>{{ a.text }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>

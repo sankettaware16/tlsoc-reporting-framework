@@ -1,0 +1,11 @@
+<div class="section">
+  <div class="kpis">
+    {% for k in sec["items"] %}
+    <div class="kpi">
+      <div class="label">{{ k.label }}</div>
+      <div class="value {{ k.style }}">{{ k.value }}</div>
+      {% if k.foot %}<div class="foot {{ k.foot_cls }}">{{ k.foot }}</div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>

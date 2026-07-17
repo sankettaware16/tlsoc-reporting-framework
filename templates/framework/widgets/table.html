@@ -1,0 +1,24 @@
+{% if not sec.half %}<div class="section">{% endif %}
+<div class="card">
+  {% if sec.title %}<div class="cap">{{ sec.title }}</div>{% endif %}
+  {% if sec.rows %}
+  <table class="data">
+    <thead>
+      <tr>{% for h in sec.headers %}<th class="{{ h.cls }}"{% if h.width %} style="width:{{ h.width }}px"{% endif %}>{{ h.label }}</th>{% endfor %}</tr>
+    </thead>
+    <tbody>
+      {% for row in sec.rows %}
+      <tr>
+        {% for cell in row %}
+        <td class="{{ cell.cls }}">{% if cell.html %}{{ cell.html }}{% else %}{{ cell.text | e }}{% endif %}</td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">{{ sec.empty_text }}</div>
+  {% endif %}
+  {% if sec.note %}<div class="note">{{ sec.note }}</div>{% endif %}
+</div>
+{% if not sec.half %}</div>{% endif %}

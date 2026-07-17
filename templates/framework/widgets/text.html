@@ -1,0 +1,5 @@
+<div class="section">
+  {% if sec.title %}<h2>{{ sec.title }}{% if sec.hint %}<span class="hint">{{ sec.hint }}</span>{% endif %}</h2>{% endif %}
+  <div class="summary-box">{{ sec.body }}</div>
+  {% if sec.note %}<div class="note">{{ sec.note }}</div>{% endif %}
+</div>

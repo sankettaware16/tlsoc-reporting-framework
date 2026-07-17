@@ -1,0 +1,6 @@
+<div class="section">
+  <div class="grid2">
+    {% if sec.left %}{% with parent = sec %}{% set sec = parent.left %}{% include "widgets/" + parent.left.type + ".html" %}{% endwith %}{% endif %}
+    {% if sec.right %}{% with parent = sec %}{% set sec = parent.right %}{% include "widgets/" + parent.right.type + ".html" %}{% endwith %}{% endif %}
+  </div>
+</div>

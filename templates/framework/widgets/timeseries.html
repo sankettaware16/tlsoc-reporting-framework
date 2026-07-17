@@ -1,0 +1,7 @@
+{% if not sec.half %}<div class="section">{% endif %}
+<div class="card">
+  {% if sec.title %}<div class="cap">{{ sec.title }}</div>{% endif %}
+  {{ sec.svg }}
+  {% if sec.note %}<div class="note">{{ sec.note }}</div>{% endif %}
+</div>
+{% if not sec.half %}</div>{% endif %}

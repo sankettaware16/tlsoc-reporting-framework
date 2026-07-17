@@ -1,0 +1,8 @@
+<div class="section">
+  {% if sec.title %}<h2>{{ sec.title }}{% if sec.hint %}<span class="hint">{{ sec.hint }}</span>{% endif %}</h2>{% endif %}
+  <div class="summary-box">
+    <ul>
+      {% for line in sec["items"] %}<li>{{ line }}</li>{% endfor %}
+    </ul>
+  </div>
+</div>
