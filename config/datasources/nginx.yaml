@@ -1,0 +1,68 @@
+# ===========================================================================
+# Datasource: nginx reverse-proxy access logs (parsed by foss-soc-engine).
+#
+# A datasource file answers exactly three questions:
+#   1. WHERE the documents live               (index)
+#   2. WHAT the logical fields are called     (fields)
+#   3. what is DIFFERENT about this estate    (params overrides)
+#
+# The `fields:` map translates the LOGICAL names used by report definitions
+# into the concrete fields of this index - including any .keyword suffix a
+# field needs to be aggregatable. Field names below were verified against
+# the live fosstlsoc-logs-nginx* mapping.
+#
+# A logical field that does not exist here is simply left out: every
+# report section that depends on it is omitted automatically.
+# ===========================================================================
+name: nginx
+label: "Web Infrastructure (Nginx / Reverse Proxy)"
+profile: web_access
+index: "fosstlsoc-logs-nginx*"
+
+fields:
+  timestamp: "@timestamp"
+  client_ip: "source.ip"
+  status_code: "http.response.status_code"
+  response_bytes: "http.response.body.bytes"
+  url_path: "url.path"                          # keyword, NO .keyword
+  url_query: "url.query"
+  method: "http.request.method.keyword"         # text + .keyword
+  referrer: "http.request.referrer.keyword"
+  user_agent: "user_agent.original.keyword"
+  geo_country: "source.geo.country_name"        # keyword, NO .keyword
+  geo_city: "source.geo.city_name"
+  service: "service.name.keyword"               # vhost/site label
+  # vhost (host.name / vh3 / vh4) is NOT indexed on this estate - it only
+  # exists inside event.original. Once log engineering maps it at parse
+  # time, add:  vhost: "host.name"  and the per-vhost sections light up.
+
+params:
+  # First-party application paths on THIS estate (Drupal). Extends the
+  # report's benign allowlist so core assets never count as probes.
+  extra_benign_path_prefixes:
+    - "/core/assets/"
+    - "/core/misc/"
+    - "/core/modules/"
+    - "/core/themes/"
+    - "/themes/"
+    - "/libraries/"
+    - "/modules/contrib/"
+    - "/modules/custom/"
+    - "/profiles/"
+    - "/sites/default/files/"
+
+  # Login/credential surface for Drupal + SSO.
+  auth_path_patterns:
+    - "/user/login*"
+    - "/user/password*"
+    - "/user/register*"
+    - "/user/reset*"
+    - "/saml_login*"
+    - "/admin*"
+    - "/login*"
+    - "/signin*"
+
+  # Campus PUBLIC ranges to tag as INTERNAL (RFC-1918 is automatic).
+  internal_cidrs: []
+  #  - "103.21.124.0/22"
+  #  - "14.139.96.0/20"

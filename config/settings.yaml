@@ -1,0 +1,40 @@
+# ===========================================================================
+# Instance settings - the ONLY file that knows about YOUR deployment.
+# Nothing in here is referenced by report definitions; move this file
+# between installations and every report keeps working.
+#
+# Secrets: DO NOT put the Elasticsearch password here. Set it in the
+# environment instead:
+#     export TLSOC_ES_PASS="..."
+# Every value below can also be overridden by env vars:
+#     TLSOC_ES_HOST, TLSOC_ES_USER, TLSOC_ES_PASS, TLSOC_ES_CA_CERT,
+#     TLSOC_OUTPUT_HTML_DIR, TLSOC_OUTPUT_PDF_DIR
+# ===========================================================================
+
+elasticsearch:
+  host: "https://YOUR-ELK-HOST:9200"
+  user: "elastic"
+  password: ""                    # <- set TLSOC_ES_PASS instead
+  ca_cert: "/opt/TLSOCDockerDeploy/certs/ca/ca.crt"
+  request_timeout: 120
+
+org:
+  name: "IIT Bombay"
+  department: "Computing Complex"
+  classification: "Internal / Restricted"
+
+locale:
+  timezone: "Asia/Kolkata"        # all report times render in this zone
+  tz_label: "IST"
+
+output:
+  # Default: reporting/output/{html,pdf}. Uncomment to redirect.
+  # html_dir: "/opt/TLSOCDockerDeploy/reporting/output/html"
+  # pdf_dir:  "/opt/TLSOCDockerDeploy/reporting/output/pdf"
+  formats: [html, pdf]
+
+pdf:
+  # Tried in order; first engine present on the host wins.
+  engines: [wkhtmltopdf, chrome, weasyprint]
+  # wkhtmltopdf_path: /usr/local/bin/wkhtmltopdf
+  # chrome_path: /usr/bin/google-chrome

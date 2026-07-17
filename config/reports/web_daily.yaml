@@ -1,0 +1,902 @@
+# ===========================================================================
+# REPORT: Daily Web Traffic & Security Intelligence
+#
+# Profile: web_access - renders for ANY datasource with that profile
+# (nginx, moodle, a future apache/haproxy/IIS source...). Everything below
+# speaks LOGICAL field names; the datasource maps them to real ES fields.
+#
+# Structure of this file:
+#   _defs      reusable filter fragments (YAML anchors)
+#   params     tunable defaults - datasources and --param override these
+#   queries    named, declarative aggregations
+#   computed   derived metrics (Jinja expressions over `q`)
+#   badges     header status chips
+#   insights   executive-summary sentences, each with a `when` guard
+#   actions    prioritised, owner-assigned follow-ups
+#   sections   the rendered layout, top to bottom
+# ===========================================================================
+name: web_daily
+title: "Daily Web Traffic & Security Report"
+profile: web_access
+description: >
+  Executive daily report for web/HTTP access logs: traffic, availability,
+  errors, attack-signature activity, scanner attribution and bandwidth.
+
+# ---------------------------------------------------------------------------
+_defs:
+  # Anything matching the signature pack, minus this estate's own assets.
+  threat_scope: &threat_scope
+    all:
+      - signatures: web_threats
+      - none:
+          - {field: url_path, prefix_param: benign_path_prefixes}
+          - {field: url_path, suffix_param: static_asset_suffixes}
+
+  # Critical/high only - used for the raw evidence samples.
+  serious_scope: &serious_scope
+    all:
+      - signatures: web_threats
+        severities: [critical, high]
+      - none:
+          - {field: url_path, prefix_param: benign_path_prefixes}
+          - {field: url_path, suffix_param: static_asset_suffixes}
+
+  # 4xx/5xx excluding client aborts (nginx 499): the real error set.
+  real_errors: &real_errors
+    all:
+      - {field: status_code, range: {gte: 400, lt: 600}}
+      - none:
+          - {field: status_code, in_param: client_abort_codes}
+
+  # Automated agents: known bot UA substrings OR no UA sent at all.
+  bot_traffic: &bot_traffic
+    any:
+      - {field: user_agent, contains_param: bot_ua_terms}
+      - {field: user_agent, in_param: empty_ua_values}
+
+# ---------------------------------------------------------------------------
+params:
+  window_hours: 24
+  top_n: 10
+  suspicious_ip_threshold: 500     # hits from one IP in window -> flagged
+  error_rate_warn: 5.0             # % that turns the health badge amber
+  error_rate_crit: 15.0            # % that turns it red
+  srv_error_rate_warn: 1.0         # % 5xx considered an availability issue
+  prev_window_min_ratio: 0.5       # smaller baseline = ingest gap, not growth
+  client_abort_codes: [499]
+  probe_success_codes: [200, 201, 202, 203, 206]
+  write_methods: [PUT, DELETE, PATCH, TRACE, CONNECT, PROPFIND, MOVE, COPY,
+                  SEARCH, MKCOL]
+
+  # Estate-specific first-party prefixes come from the datasource
+  # (extra_benign_path_prefixes) and are appended to this list.
+  benign_path_prefixes: []
+
+  # Static assets are never exploit targets; removes the FP tail.
+  static_asset_suffixes:
+    [".js", ".mjs", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif",
+     ".svg", ".ico", ".webp", ".avif", ".woff", ".woff2", ".ttf", ".eot",
+     ".otf", ".mp4", ".webm", ".mp3", ".pdf", ".docx", ".pptx", ".xlsx"]
+
+  # 404s that are expected by design (agent/well-known discovery) - split
+  # out so the web team only sees links it can actually fix.
+  expected_404_prefixes:
+    ["/.well-known/", "/ads.txt", "/app-ads.txt", "/sellers.json",
+     "/browserconfig.xml", "/.env.example", "/sitemap_index.xml"]
+
+  # Login surface - datasources override with their app's real routes.
+  auth_path_patterns: []
+
+  # Automated-agent UA substrings, matched case-insensitively.
+  bot_ua_terms:
+    ["bot", "spider", "crawl", "scan", "curl", "wget", "python", "go-http",
+     "java/", "nikto", "sqlmap", "nmap", "masscan", "zgrab", "censys",
+     "semrush", "ahrefs", "mj12", "dotbot", "petalbot", "bytespider",
+     "facebookexternalhit", "headless", "phantomjs", "okhttp", "libwww",
+     "http_request", "apache-httpclient", "axios", "node-fetch", "postman",
+     "guzzle", "winhttp", "uptimerobot", "pingdom", "archive.org_bot"]
+  empty_ua_values: ["-", "unknown"]
+
+  # Known good crawler IP prefixes -> labelled BOT in source tables.
+  bot_ip_prefixes:
+    "66.249.": "Googlebot"
+    "64.233.": "Googlebot"
+    "157.55.": "Bingbot"
+    "207.46.": "Bingbot"
+    "40.77.": "Bingbot"
+    "199.16.": "Twitterbot"
+    "17.58.": "Applebot"
+    "5.255.": "YandexBot"
+    "95.108.": "YandexBot"
+    "106.75.": "Sogou"
+    "220.181.": "Baiduspider"
+  internal_cidrs: []
+
+# ---------------------------------------------------------------------------
+queries:
+  total_requests: {kind: count}
+  unique_visitors: {kind: cardinality, field: client_ip}
+  total_bytes: {kind: sum, field: response_bytes}
+
+  status_classes:
+    kind: range_buckets
+    field: status_code
+    ranges:
+      - {key: "1xx", from: 100, to: 200}
+      - {key: "2xx", from: 200, to: 300}
+      - {key: "3xx", from: 300, to: 400}
+      - {key: "4xx", from: 400, to: 499}
+      - {key: "499", from: 499, to: 500}
+      - {key: "5xx", from: 500, to: 600}
+
+  hourly:
+    kind: date_histogram
+    interval: hour
+    sub_aggs:
+      visitors: {kind: cardinality, field: client_ip}
+      errors: {kind: filter, filter: *real_errors}
+
+  hourly_probes:
+    kind: date_histogram
+    interval: hour
+    filter: *threat_scope
+
+  top_urls: {kind: terms, field: url_path, size: $top_n}
+
+  top_4xx_paths:
+    kind: terms
+    field: url_path
+    size: $top_n
+    filter:
+      all:
+        - {field: status_code, range: {gte: 400, lt: 500}}
+        - none: [{field: status_code, in_param: client_abort_codes}]
+
+  # 5xx rolled up by path prefix: individually-listed 5xx paths hide storms
+  # (hundreds of unique generated URLs at a few hits each).
+  err5xx_clusters:
+    kind: terms
+    field: url_path
+    size: 500
+    filter: {field: status_code, range: {gte: 500, lt: 600}}
+    sub_aggs:
+      codes: {kind: top_terms, field: status_code, size: 3}
+    transforms:
+      - cluster_paths: {depth: 4, collect: [codes]}
+      - limit: {size: $top_n}
+
+  # -- 404 triage: probe / expected-by-design / genuinely broken ----------
+  c404_total:
+    kind: count
+    filter: {field: status_code, equals: 404}
+  c404_probe:
+    kind: count
+    filter:
+      all:
+        - {field: status_code, equals: 404}
+        - *threat_scope
+  c404_expected:
+    kind: count
+    filter:
+      all:
+        - {field: status_code, equals: 404}
+        - {field: url_path, prefix_param: expected_404_prefixes}
+        - none: [{signatures: web_threats}]
+  broken_links:
+    kind: terms
+    field: url_path
+    size: $top_n
+    filter:
+      all:
+        - {field: status_code, equals: 404}
+        - none:
+            - {signatures: web_threats}
+            - {field: url_path, prefix_param: expected_404_prefixes}
+    sub_aggs:
+      referrer: {kind: top_terms, field: referrer, size: 1, missing: "-"}
+
+  methods: {kind: terms, field: method, size: $top_n, optional: true}
+
+  write_methods:
+    kind: terms
+    field: method
+    size: 10
+    filter: {field: method, in_param: write_methods}
+    optional: true
+    sub_aggs:
+      ips: {kind: top_terms, field: client_ip, size: 3}
+      paths: {kind: top_terms, field: url_path, size: 2}
+      codes: {kind: top_terms, field: status_code, size: 3}
+
+  referrers:
+    kind: terms
+    field: referrer
+    size: $top_n
+    missing: "(direct / none)"
+    optional: true
+
+  countries:
+    kind: terms
+    field: geo_country
+    size: $top_n
+    missing: "Unresolved"
+    optional: true
+
+  top_ips:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    sub_aggs:
+      country: {kind: top_terms, field: geo_country, size: 1}
+      city: {kind: top_terms, field: geo_city, size: 1}
+      ua: {kind: top_terms, field: user_agent, size: 1}
+      unique_paths: {kind: cardinality, field: url_path}
+      errors: {kind: filter, filter: *real_errors}
+      bytes: {kind: sum, field: response_bytes}
+    transforms:
+      - classify_ip: {}
+      - derive_pct: {num: errors, den: count, to: err_pct}
+
+  suspicious_ips:
+    kind: terms
+    field: client_ip
+    size: 30
+    sub_aggs:
+      country: {kind: top_terms, field: geo_country, size: 1}
+      city: {kind: top_terms, field: geo_city, size: 1}
+      unique_paths: {kind: cardinality, field: url_path}
+      errors: {kind: filter, filter: *real_errors}
+    transforms:
+      - classify_ip: {}
+      - derive_pct: {num: errors, den: count, to: err_pct}
+      - min_count: {value: $suspicious_ip_threshold}
+
+  bandwidth_paths:
+    kind: terms
+    field: url_path
+    size: $top_n
+    order_by: bytes
+    sub_aggs:
+      bytes: {kind: sum, field: response_bytes}
+
+  bandwidth_ips:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    order_by: bytes
+    sub_aggs:
+      bytes: {kind: sum, field: response_bytes}
+      country: {kind: top_terms, field: geo_country, size: 1}
+      ua: {kind: top_terms, field: user_agent, size: 1}
+    transforms:
+      - classify_ip: {}
+
+  # -- security: signature-based probe detection --------------------------
+  threat_breakdown:
+    kind: signature_categories
+    pack: web_threats
+    filter: *threat_scope
+    sub_aggs:
+      unique_ips: {kind: cardinality, field: client_ip}
+      top_path: {kind: top_terms, field: url_path, size: 1}
+      top_ip: {kind: top_terms, field: client_ip, size: 1}
+      served: {kind: filter,
+               filter: {field: status_code, in_param: probe_success_codes}}
+
+  probe_total: {kind: count, filter: *threat_scope}
+  probe_unique_ips: {kind: cardinality, field: client_ip,
+                     filter: *threat_scope}
+  probe_served_total:
+    kind: count
+    filter:
+      all:
+        - *threat_scope
+        - {field: status_code, in_param: probe_success_codes}
+
+  probe_paths:
+    kind: terms
+    field: url_path
+    size: $top_n
+    filter: *threat_scope
+
+  probe_served_paths:
+    kind: terms
+    field: url_path
+    size: 5
+    filter:
+      all:
+        - *threat_scope
+        - {field: status_code, in_param: probe_success_codes}
+    sub_aggs:
+      ip: {kind: top_terms, field: client_ip, size: 1}
+
+  probe_ips:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    filter: *threat_scope
+    sub_aggs:
+      country: {kind: top_terms, field: geo_country, size: 1}
+      city: {kind: top_terms, field: geo_city, size: 1}
+      ua: {kind: top_terms, field: user_agent, size: 1}
+      unique_paths: {kind: cardinality, field: url_path}
+      served: {kind: filter,
+               filter: {field: status_code, in_param: probe_success_codes}}
+    transforms:
+      - classify_ip: {}
+
+  probe_samples:
+    kind: samples
+    size: 8
+    filter: *serious_scope
+    fields: [timestamp, client_ip, geo_country, method, url_path,
+             status_code, user_agent]
+
+  # -- authentication surface ---------------------------------------------
+  auth_total:
+    kind: count
+    optional: true
+    filter: {field: url_path, wildcard_param: auth_path_patterns}
+  auth_posts:
+    kind: count
+    optional: true
+    filter:
+      all:
+        - {field: url_path, wildcard_param: auth_path_patterns}
+        - {field: method, equals: "POST"}
+  auth_denied:
+    kind: count
+    optional: true
+    filter:
+      all:
+        - {field: url_path, wildcard_param: auth_path_patterns}
+        - {field: status_code, in: [401, 403]}
+  auth_ips:
+    kind: terms
+    field: client_ip
+    size: 5
+    optional: true
+    filter: {field: url_path, wildcard_param: auth_path_patterns}
+    sub_aggs:
+      country: {kind: top_terms, field: geo_country, size: 1}
+      posts: {kind: filter, filter: {field: method, equals: "POST"}}
+    transforms:
+      - classify_ip: {}
+
+  # -- automated agents -----------------------------------------------------
+  bots_total: {kind: count, filter: *bot_traffic, optional: true}
+  bots_unique_ips: {kind: cardinality, field: client_ip,
+                    filter: *bot_traffic, optional: true}
+  bot_agents:
+    kind: terms
+    field: user_agent
+    size: $top_n
+    missing: "(no user-agent)"
+    optional: true
+    filter: *bot_traffic
+    sub_aggs:
+      ips: {kind: cardinality, field: client_ip}
+      bytes: {kind: sum, field: response_bytes}
+    transforms:
+      - flag_match: {terms_param: bot_ua_terms,
+                     fallback_param: empty_ua_values, to: matched}
+
+  # -- per-service breakdown (only when the datasource maps `service`) -----
+  services:
+    kind: terms
+    field: service
+    size: $top_n
+    optional: true
+    sub_aggs:
+      bytes: {kind: sum, field: response_bytes}
+      visitors: {kind: cardinality, field: client_ip}
+      errors: {kind: filter, filter: *real_errors}
+    transforms:
+      - derive_pct: {num: errors, den: count, to: err_pct}
+
+  # -- previous window, for trend arrows ------------------------------------
+  prev_total: {kind: count, window: previous}
+  prev_visitors: {kind: cardinality, field: client_ip, window: previous}
+  prev_bytes: {kind: sum, field: response_bytes, window: previous}
+  prev_errors: {kind: count, window: previous, filter: *real_errors}
+
+# ---------------------------------------------------------------------------
+computed:
+  - {name: total, expr: "q.total_requests or 0"}
+  - {name: ok_1xx, expr: "q.status_classes.get('1xx', 0)"}
+  - {name: ok_2xx, expr: "q.status_classes.get('2xx', 0)"}
+  - {name: redir_3xx, expr: "q.status_classes.get('3xx', 0)"}
+  - {name: err_4xx, expr: "q.status_classes.get('4xx', 0)"}
+  - {name: client_abort, expr: "q.status_classes.get('499', 0)"}
+  - {name: err_5xx, expr: "q.status_classes.get('5xx', 0)"}
+  - name: unclassified
+    expr: "max(c.total - c.ok_1xx - c.ok_2xx - c.redir_3xx - c.err_4xx
+               - c.client_abort - c.err_5xx, 0)"
+  - {name: error_rate, expr: "pct(c.err_4xx + c.err_5xx, c.total)"}
+  - {name: srv_error_rate, expr: "pct(c.err_5xx, c.total)"}
+
+  # A previous window far smaller than the current one is an ingest gap,
+  # not real growth - suppress trend arrows rather than print "+145%".
+  - name: prev_reliable
+    expr: "(q.prev_total or 0) >= c.total * params.prev_window_min_ratio
+           and (q.prev_total or 0) > 0"
+  - name: delta_requests
+    expr: "delta_pct(c.total, q.prev_total) if c.prev_reliable else None"
+  - name: delta_visitors
+    expr: "delta_pct(q.unique_visitors, q.prev_visitors)
+           if c.prev_reliable else None"
+  - name: delta_bytes
+    expr: "delta_pct(q.total_bytes, q.prev_bytes)
+           if c.prev_reliable else None"
+  - name: delta_error_rate
+    expr: "(c.error_rate - pct(q.prev_errors, q.prev_total))
+           if c.prev_reliable else None"
+  - name: data_warning
+    expr: "None if c.prev_reliable or c.total == 0 else
+           'Previous window logged only ' ~ human_int(q.prev_total) ~
+           ' requests against ' ~ human_int(c.total) ~ ' now — almost
+           certainly an ingest gap rather than real change, so trend
+           comparisons are suppressed for this run.'"
+
+  - name: genuine_404
+    expr: "max((q.c404_total or 0) - (q.c404_probe or 0)
+               - (q.c404_expected or 0), 0)"
+
+  - name: has_critical
+    expr: "q.threat_breakdown | selectattr('severity', 'equalto',
+           'critical') | list | length > 0"
+  - name: has_high
+    expr: "q.threat_breakdown | selectattr('severity', 'equalto', 'high')
+           | list | length > 0"
+  - name: security_score
+    expr: "(3 if (q.probe_served_total or 0) > 0 else 0)
+           + (2 if c.has_critical else 0)
+           + (1 if c.has_high else 0)
+           + (1 if (q.probe_unique_ips or 0) >= 50 else 0)
+           + (1 if (q.auth_denied or 0) >= 100 else 0)"
+
+# ---------------------------------------------------------------------------
+badges:
+  - id: health
+    label: "Service health"
+    levels:
+      - {when: "c.error_rate >= params.error_rate_crit",
+         text: CRITICAL, color: red}
+      - {when: "c.error_rate >= params.error_rate_warn",
+         text: ELEVATED, color: amber}
+      - {text: HEALTHY, color: green}
+  - id: security
+    label: "Security posture"
+    levels:
+      - {when: "c.security_score >= 4", text: ELEVATED, color: red}
+      - {when: "c.security_score >= 2", text: WATCH, color: amber}
+      - {text: ROUTINE, color: green}
+
+# ---------------------------------------------------------------------------
+insights:
+  - when: "c.total == 0"
+    stop: true
+    text: >
+      No web traffic was recorded in the reporting window. Verify that the
+      log pipeline is still forwarding events and that {{ ds.index }} is
+      receiving documents.
+
+  - text: >
+      {{ human_int(c.total) }} requests from
+      {{ human_int(q.unique_visitors) }} unique sources, serving
+      {{ human_bytes(q.total_bytes) }}
+      {%- if c.delta_requests is not none %}
+      ({{ "▲" if c.delta_requests > 0 else "▼" }}
+      {{ "%.1f" | format(c.delta_requests | abs) }}% vs previous
+      {{ window.hours }}h){% endif %}.
+
+  - text: >
+      Error rate was {{ "%.2f" | format(c.error_rate) }}%
+      ({{ human_int(c.err_4xx + c.err_5xx) }} of {{ human_int(c.total) }}
+      requests). Server-side failures (5xx) were
+      {{ "%.2f" | format(c.srv_error_rate) }}%
+      ({{ human_int(c.err_5xx) }} requests)
+      {%- if c.client_abort %}, and {{ human_int(c.client_abort) }}
+      additional requests were abandoned by the client before a response
+      completed — these are excluded from the error rate{% endif %}.
+
+  - when: "q.hourly"
+    text: >
+      {% set peak = q.hourly | max(attribute='count') %}
+      {% set quiet = q.hourly | min(attribute='count') %}
+      Traffic peaked at {{ peak.label }} {{ window.tz_label }} with
+      {{ human_int(peak.count) }} requests in the hour, against a
+      quiet-hour floor of {{ human_int(quiet.count) }} at
+      {{ quiet.label }} {{ window.tz_label }}.
+
+  - when: "q.countries and q.countries | length > 1"
+    text: >
+      {{ q.countries[0].key }} accounted for
+      {{ "%.1f" | format(pct(q.countries[0].count, c.total)) }}% of
+      requests; the next largest sources were
+      {{ q.countries[1:4] | map(attribute='key') | join(', ') }}
+      ({{ "%.1f" | format(pct(q.countries[1:4] | map(attribute='count')
+      | sum, c.total)) }}% combined).
+
+  - when: "(q.probe_total or 0) > 0"
+    text: >
+      {% set by_vol = q.threat_breakdown | sort(attribute='count',
+         reverse=true) %}
+      {{ human_int(q.probe_total) }} requests
+      ({{ "%.2f" | format(pct(q.probe_total, c.total)) }}% of traffic) from
+      {{ human_int(q.probe_unique_ips) }} distinct sources matched attack
+      signatures{% if by_vol %} — by volume chiefly
+      {{ by_vol[:3] | map(attribute='title') | map('lower') | join(', ') }};
+      {{ by_vol[0].title | lower }} alone is
+      {{ "%.0f" | format(pct(by_vol[0].count, q.probe_total)) }}% of it
+      {%- endif %}.
+      {%- if c.has_critical %} Critical-severity categories were seen.
+      {%- endif %}
+
+  - when: "(q.probe_total or 0) == 0"
+    text: >
+      No requests matched the exploit, traversal, secret-file or
+      foreign-CMS signature set.
+
+  - when: "(q.probe_served_total or 0) > 0"
+    text: >
+      ATTENTION: {{ human_int(q.probe_served_total) }} probe requests were
+      answered with content (HTTP 2xx) rather than rejected. These paths
+      are listed under Security Signals and should be confirmed as
+      intentional or blocked at the proxy.
+
+  - when: "q.probe_ips"
+    text: >
+      The most persistent scanner was {{ q.probe_ips[0].key }}
+      ({{ q.probe_ips[0].location }}) with
+      {{ human_int(q.probe_ips[0].count) }} probe requests across
+      {{ human_int(q.probe_ips[0].unique_paths) }} distinct paths.
+
+  - when: "(q.bots_total or 0) > 0"
+    text: >
+      Automated agents (crawlers, scripted clients, monitoring) accounted
+      for {{ human_int(q.bots_total) }} requests
+      ({{ "%.1f" | format(pct(q.bots_total, c.total)) }}%) from
+      {{ human_int(q.bots_unique_ips) }} addresses.
+
+  - when: "q.suspicious_ips"
+    text: >
+      {{ q.suspicious_ips | length }} source IP(s) exceeded the
+      {{ human_int(params.suspicious_ip_threshold) }}-request volume
+      threshold; the noisiest was {{ q.suspicious_ips[0].key }}
+      ({{ q.suspicious_ips[0].location }}) with
+      {{ human_int(q.suspicious_ips[0].count) }} requests and a
+      {{ "%.1f" | format(q.suspicious_ips[0].err_pct) }}% error ratio.
+
+  - when: "(q.c404_total or 0) > 0"
+    text: >
+      {{ human_int(q.c404_total) }} responses were 404:
+      {{ human_int(q.c404_probe) }} scanner probes (correctly rejected),
+      {{ human_int(q.c404_expected) }} well-known discovery paths that 404
+      by design, and {{ human_int(c.genuine_404) }} genuine broken links —
+      the last group is the web team's list.
+
+# ---------------------------------------------------------------------------
+actions:
+  - when: "(q.probe_served_total or 0) > 0"
+    priority: P1
+    owner: "SOC + Web team"
+    text: >
+      Confirm why probe paths returned 2xx:
+      {{ q.probe_served_paths | map(attribute='key') | join(', ') }}.
+      If they are not intentional, deny them at the reverse proxy and hunt
+      for follow-on activity from the same sources.
+
+  - when: "c.has_critical"
+    priority: P2
+    owner: "SOC"
+    text: >
+      {% set crit = q.threat_breakdown | selectattr('severity', 'equalto',
+         'critical') | list %}
+      Critical-signature activity observed
+      ({{ crit[:2] | map(attribute='title') | join(', ') }}). Add
+      {{ crit[:3] | map(attribute='top_ip') | join(', ') }} to the
+      fail2ban / WAF blocklist and confirm no matching 2xx responses exist
+      for those paths.
+
+  - when: "c.srv_error_rate >= params.srv_error_rate_warn"
+    priority: P2
+    owner: "Web team"
+    text: >
+      5xx rate is {{ "%.2f" | format(c.srv_error_rate) }}%
+      ({{ human_int(c.err_5xx) }} requests). Review the upstream
+      application pool and the paths listed under Server Errors.
+
+  - when: "(q.auth_denied or 0) > 0"
+    priority: P3
+    owner: "SOC"
+    text: >
+      {{ human_int(q.auth_denied) }} authentication attempts were rejected
+      (401/403) across the login surface. Confirm rate limiting is
+      enforced on the login endpoints.
+
+  - when: "q.write_methods"
+    priority: P3
+    owner: "Web team"
+    text: >
+      Non-read HTTP methods reached the origin:
+      {% for r in q.write_methods[:4] %}{{ r.key }}
+      ({{ human_int(r.count) }}){{ ", " if not loop.last }}{% endfor %}.
+      If the application does not need them, reject them at the web server.
+
+  - when: "q.broken_links"
+    priority: P4
+    owner: "Web team"
+    text: >
+      Fix the top broken link: {{ q.broken_links[0].key }}
+      ({{ human_int(q.broken_links[0].count) }} 404s, referred from
+      {{ q.broken_links[0].referrer }}).
+
+# ---------------------------------------------------------------------------
+sections:
+  - {type: heading, title: "Executive summary"}
+  - {type: insights}
+
+  - type: kpi_row
+    items:
+      - {label: "Total requests", value: "c.total", format: int,
+         delta: "c.delta_requests"}
+      - {label: "Unique visitors", value: "q.unique_visitors", format: int,
+         delta: "c.delta_visitors"}
+      - {label: "Bandwidth served", value: "q.total_bytes", format: bytes,
+         delta: "c.delta_bytes"}
+      - {label: "Error rate", value: "c.error_rate", format: pct2,
+         delta: "c.delta_error_rate", down_is_good: true,
+         style: "'crit' if c.error_rate >= params.error_rate_crit else
+                 ('warn' if c.error_rate >= params.error_rate_warn
+                 else 'ok')"}
+
+  - type: kpi_row
+    items:
+      - {label: "Server errors (5xx)", value: "c.err_5xx", format: int,
+         style: "'crit' if c.srv_error_rate >=
+                 params.srv_error_rate_warn else 'ok'"}
+      - {label: "404 responses", value: "q.c404_total", format: int}
+      - {label: "Probe requests", value: "q.probe_total", format: int,
+         style: "'warn' if (q.probe_total or 0) > 0 else 'ok'",
+         foot: "{{ human_int(q.probe_unique_ips) }} distinct sources"}
+      - {label: "Probes served 2xx", value: "q.probe_served_total",
+         format: int,
+         style: "'crit' if (q.probe_served_total or 0) > 0 else 'ok'",
+         foot: "{{ 'REVIEW REQUIRED' if (q.probe_served_total or 0) > 0
+                else 'all probes rejected' }}"}
+
+  # ---- traffic ------------------------------------------------------------
+  - {type: heading, title: "Traffic overview"}
+  - type: timeseries
+    title: "Requests per hour"
+    query: hourly
+    overlay: hourly_probes
+    series_label: "requests / hour"
+    overlay_label: "probe volume"
+
+  - type: row
+    left:
+      type: donut
+      title: "Response status mix"
+      center_label: "requests"
+      slices:
+        - {label: "1xx Informational", expr: "c.ok_1xx", color: purple}
+        - {label: "2xx Success", expr: "c.ok_2xx", color: green}
+        - {label: "3xx Redirect", expr: "c.redir_3xx", color: sky}
+        - {label: "4xx Client error", expr: "c.err_4xx", color: amber}
+        - {label: "499 Client aborted", expr: "c.client_abort", color: grey}
+        - {label: "5xx Server error", expr: "c.err_5xx", color: red}
+        - {label: "No status logged", expr: "c.unclassified", color: faint}
+    right:
+      type: bars
+      title: "Requests by source country"
+      query: countries
+      color: teal
+
+  - type: bars
+    title: "Top requested paths"
+    query: top_urls
+    color: blue
+
+  - type: row
+    left: {type: bars, title: "HTTP methods", query: methods, color: navy,
+           show_pct: true}
+    right: {type: bars, title: "Top referrers", query: referrers,
+            color: teal}
+
+  # ---- errors ---------------------------------------------------------------
+  - {type: heading, title: "Errors & availability"}
+  - type: bars
+    title: "Top client-error (4xx) paths"
+    query: top_4xx_paths
+    color: amber
+
+  - type: table
+    title: "Server errors (5xx), clustered by path prefix"
+    query: err5xx_clusters
+    hide_if_empty: true
+    note: "Clustering by prefix makes error storms visible as one row
+           instead of hundreds of unique URLs."
+    columns:
+      - {key: key, label: "Path prefix", format: mono, max: 62}
+      - {key: paths, label: "Distinct paths", format: int}
+      - {key: codes, label: "Codes"}
+      - {key: count, label: "Requests", format: int}
+
+  - type: table
+    title: "Genuine broken links (404, probe & discovery noise removed)"
+    query: broken_links
+    hide_if_empty: true
+    note: "{{ human_int(q.c404_probe) }} scanner-probe 404s and
+           {{ human_int(q.c404_expected) }} expected discovery-path 404s
+           are excluded — this list is actionable by the web team."
+    columns:
+      - {key: key, label: "Missing path", format: mono, max: 52}
+      - {key: count, label: "Hits", format: int}
+      - {key: referrer, label: "Top referrer", max: 40}
+
+  - type: table
+    title: "Unusual (write) HTTP methods reaching the origin"
+    query: write_methods
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Method"}
+      - {key: count, label: "Requests", format: int}
+      - {key: ips, label: "Top sources", format: mono, max: 44}
+      - {key: paths, label: "Top paths", format: mono, max: 44}
+      - {key: codes, label: "Codes"}
+
+  # ---- security ---------------------------------------------------------------
+  - {type: heading, title: "Security signals",
+     hint: "signature-based; benign first-party paths excluded"}
+
+  - type: table
+    title: "Attack-signature categories"
+    query: threat_breakdown
+    empty_text: "No requests matched the signature pack in this window."
+    columns:
+      - {key: severity, label: "Sev", format: sev}
+      - {key: title, label: "Category", max: 40}
+      - {key: count, label: "Hits", format: int}
+      - {key: unique_ips, label: "Sources", format: int}
+      - {key: served, label: "Served 2xx", format: int}
+      - {key: top_path, label: "Most-hit path", format: mono, max: 40}
+      - {key: top_ip, label: "Top source", format: mono, width: 104, nowrap: true}
+
+  - type: bars
+    title: "Most-probed paths"
+    query: probe_paths
+    color: red
+
+  - type: table
+    title: "Probe sources"
+    query: probe_ips
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: location, label: "Location", max: 24}
+      - {key: count, label: "Probes", format: int}
+      - {key: unique_paths, label: "Paths", format: int}
+      - {key: served, label: "Served 2xx", format: int}
+      - {key: ua, label: "User agent", max: 34}
+
+  - type: table
+    title: "⚠ Probe paths answered with 2xx content"
+    query: probe_served_paths
+    hide_if_empty: true
+    note: "Every row here is either an intentional public path that
+           matches an attack signature (tune the allowlist) or a real
+           exposure (block and investigate)."
+    columns:
+      - {key: key, label: "Path", format: mono, max: 56}
+      - {key: count, label: "Hits", format: int}
+      - {key: ip, label: "Top source", format: mono, width: 104, nowrap: true}
+
+  - type: samples
+    title: "Latest critical/high-severity probe samples (raw evidence)"
+    query: probe_samples
+    hide_if_empty: true
+    columns:
+      - {key: timestamp, label: "Time", format: dt}
+      - {key: client_ip, label: "Source", format: mono, width: 104, nowrap: true}
+      - {key: geo_country, label: "Country", max: 16}
+      - {key: method, label: "Method"}
+      - {key: url_path, label: "Path", format: mono, max: 46}
+      - {key: status_code, label: "Status"}
+
+  - type: table
+    title: "Authentication surface activity"
+    query: auth_ips
+    show_if: "(q.auth_total or 0) > 0"
+    note: "{{ human_int(q.auth_total) }} requests to login/credential
+           endpoints; {{ human_int(q.auth_posts) }} POSTs;
+           {{ human_int(q.auth_denied) }} rejected (401/403)."
+    columns:
+      - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: country, label: "Country", max: 20}
+      - {key: count, label: "Requests", format: int}
+      - {key: posts, label: "POSTs", format: int}
+
+  - type: table
+    title: "Automated agents (bots, scripts, monitors)"
+    query: bot_agents
+    hide_if_empty: true
+    note: "The 'matched' column names the configured term that classified
+           each agent — an over-broad term becomes visible here instead
+           of arguable."
+    columns:
+      - {key: key, label: "User agent", max: 48}
+      - {key: matched, label: "Matched"}
+      - {key: count, label: "Requests", format: int}
+      - {key: ips, label: "IPs", format: int}
+      - {key: bytes, label: "Bandwidth", format: bytes}
+
+  # ---- sources & bandwidth ---------------------------------------------------
+  - {type: heading, title: "Traffic sources"}
+  - type: table
+    title: "Top source IPs"
+    query: top_ips
+    columns:
+      - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: location, label: "Location", max: 22}
+      - {key: count, label: "Requests", format: int}
+      - {key: unique_paths, label: "Paths", format: int}
+      - {key: err_pct, label: "Err %", format: pct}
+      - {key: bytes, label: "Bandwidth", format: bytes}
+
+  - type: table
+    title: "Sources above the volume threshold
+            ({{ human_int(params.suspicious_ip_threshold) }}+ requests)"
+    query: suspicious_ips
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: location, label: "Location", max: 22}
+      - {key: count, label: "Requests", format: int}
+      - {key: unique_paths, label: "Paths", format: int}
+      - {key: err_pct, label: "Err %", format: pct}
+
+  - type: row
+    left:
+      type: table
+      title: "Bandwidth by path"
+      query: bandwidth_paths
+      columns:
+        - {key: key, label: "Path", format: mono, max: 30}
+        - {key: count, label: "Hits", format: int}
+        - {key: bytes, label: "Bytes", format: bytes}
+    right:
+      type: table
+      title: "Bandwidth by source (scraper signature)"
+      query: bandwidth_ips
+      columns:
+        - {key: key, label: "Source", format: mono, width: 100, nowrap: true}
+        - {key: scope, label: "Class", format: pill,
+           pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+        - {key: bytes, label: "Bytes", format: bytes}
+
+  # ---- services (nginx multi-vhost estates only) ------------------------------
+  - type: table
+    title: "Per-service breakdown"
+    query: services
+    skip_if_unmapped: [service]
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Service / site"}
+      - {key: count, label: "Requests", format: int}
+      - {key: visitors, label: "Visitors", format: int}
+      - {key: err_pct, label: "Err %", format: pct}
+      - {key: bytes, label: "Bandwidth", format: bytes}
+
+  # ---- actions -----------------------------------------------------------------
+  - {type: heading, title: "Recommended actions"}
+  - {type: actions}
