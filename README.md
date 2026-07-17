@@ -45,24 +45,69 @@ one report definition  ×  every datasource with a matching profile
 
 ## Installation
 
+### Option A — on a TLSOC host (zero configuration)
+
+This framework is the reporting companion of the TLSOC docker stack. On a
+host that runs the stack (default `/opt/TLSOCDockerDeploy`), the ES host,
+password and CA certificate are **auto-detected from the deployment
+itself** — there is nothing to configure:
+
 ```bash
-git clone git@github.com:<you>/tlsoc-reporting-framework.git
+cd /opt
+sudo git clone https://github.com/<you>/tlsoc-reporting-framework.git
+sudo chown -R $USER: tlsoc-reporting-framework
 cd tlsoc-reporting-framework
-pip install -r requirements.txt
 
-# secrets: never stored in the repo
-cp .env.example .env
-nano .env                      # set TLSOC_ES_PASS
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+sudo apt install -y wkhtmltopdf        # PDF engine (skip if already there)
 
-# point it at your deployment
-nano config/settings.yaml      # ES host, CA cert, org name, timezone
+.venv/bin/python -m framework validate
+.venv/bin/python -m framework generate --report web_daily --datasource moodle
 ```
 
-Sanity checks:
+On startup you'll see a line like
+`[settings] auto-detected TLSOC deployment in /opt/TLSOCDockerDeploy: host=..., password, ca_cert`
+confirming where the connection came from. If the stack lives somewhere
+else, set `tlsoc_deploy.dir` in `config/settings.yaml`.
+
+### Option B — any other machine (manual configuration)
+
+When there is no co-located stack, tell the framework where Elasticsearch
+is. **Both** steps:
+
+1. `config/settings.yaml` — the non-secret connection + identity values:
+
+   | key | meaning | example |
+   |---|---|---|
+   | `elasticsearch.host` | cluster URL | `https://10.0.0.5:9200` |
+   | `elasticsearch.user` | user with read access to the log indexes | `elastic` |
+   | `elasticsearch.ca_cert` | CA file that signed the cluster cert (copy it to this machine) | `/etc/tlsoc/ca.crt` |
+   | `org.*` | name/department printed on every report | |
+   | `locale.*` | timezone the reports render in | `Asia/Kolkata` |
+
+2. The password — never in a file that gets committed:
+
+   ```bash
+   cp .env.example .env
+   nano .env                # TLSOC_ES_PASS=...
+   set -a; source .env; set +a     # for manual shell runs
+   ```
+   (`scripts/daily_reports.sh` loads `.env` automatically; only manual
+   shell sessions need the `source` line.)
+
+Precedence, highest wins: env vars → `settings.yaml` → auto-detected
+deployment → built-in defaults.
+
+### Sanity checks (both options)
 
 ```bash
 python3 -m framework list       # datasources, reports, runnable pairs
 python3 -m framework validate   # compile-check everything, no ES needed
+
+# full render with ZERO infrastructure - proves the install end to end:
+python3 -m framework generate --report web_daily --datasource moodle \
+    --backend local --sample log_samples/moodleapplication_sample.json
 ```
 
 ## Usage
@@ -122,6 +167,9 @@ can alert on it. What to look for when something goes wrong:
 | Report exists but a section is missing | `warning:` lines in the log (unmapped field, failed query) |
 | Numbers look wrong / empty | header of the report itself — ingest-gap and degraded-query warnings are printed on the page |
 | PDF missing, HTML present | `PDF generation failed` warning in the log; install/fix a PDF engine |
+| `CERTIFICATE_VERIFY_FAILED ... key identifier mismatch` | You're pointing at a different cluster than the CA belongs to — check `elasticsearch.host` and `ca_cert` describe the SAME deployment |
+| `Fielddata is disabled on [<field>]` | That index maps the field as `text`; aggregate its keyword subfield instead — set e.g. `url_path: "url.path.keyword"` in the datasource's field map |
+| Queries return 0 but the index has data | Index pattern in the datasource doesn't match — compare with `GET _cat/indices` |
 
 ## Configuration guide
 
@@ -228,6 +276,8 @@ insights). Estate-specific false positives go in that datasource's
 - The Elasticsearch password comes **only** from the environment
   (`TLSOC_ES_PASS`, usually via the git-ignored `.env`). Nothing secret is
   committed.
-- Generated reports and sample logs can contain internal IPs, hostnames
-  and email addresses — the repo should stay **private**, and `output/`
-  is git-ignored for that reason.
+- Generated reports are git-ignored (`output/`) — they contain real
+  traffic data and must never be committed.
+- `log_samples/` can contain internal IPs, hostnames and email
+  addresses. Keep the repo **private**, or replace the samples with
+  anonymised data before making it public.
