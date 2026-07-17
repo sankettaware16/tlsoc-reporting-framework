@@ -94,22 +94,22 @@ platform-wide picture:
 
 - Python 3.10+
 - An Elasticsearch 8.x cluster with parsed, ECS-style logs — as produced by
-  [tlsoc-engine](https://github.com/sankettaware16/tlsoc-engine)
+  [foss-soc-engine](https://github.com/sankettaware16/foss-soc-engine)
 - One PDF engine on the host: `wkhtmltopdf`, Google Chrome/Chromium, or
   `weasyprint` (optional — HTML output works without any)
 
 ### Option A — on a TLSOC stack host (zero configuration)
 
 On a host running
-[tlsoc-docker-deploy](https://github.com/sankettaware16/tlsoc-docker-deploy),
+[TLSOCDockerDeploy](https://github.com/sankettaware16/TLSOCDockerDeploy),
 the Elasticsearch host, password, and CA certificate are **auto-detected from
 the deployment itself**:
 
 ```bash
 cd /opt
-sudo git clone https://github.com/sankettaware16/tlsoc-reporting.git
-sudo chown -R $USER: tlsoc-reporting
-cd tlsoc-reporting
+sudo git clone https://github.com/sankettaware16/tlsoc-reporting-framework.git
+sudo chown -R $USER: tlsoc-reporting-framework
+cd tlsoc-reporting-framework
 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -122,9 +122,8 @@ sudo apt install -y wkhtmltopdf        # PDF engine (skip if already there)
 On startup you'll see a
 `[settings] auto-detected TLSOC deployment in ...: host=..., password, ca_cert`
 line confirming where the connection came from. Auto-detection looks in
-`/opt/TLSOCDockerDeploy` by default — if your stack lives elsewhere (for
-example a new clone at `/opt/tlsoc-docker-deploy`), set `tlsoc_deploy.dir` in
-`config/settings.yaml`.
+`/opt/TLSOCDockerDeploy` by default — if your stack lives elsewhere, set
+`tlsoc_deploy.dir` in `config/settings.yaml`.
 
 ### Option B — any other machine (manual configuration)
 
@@ -224,9 +223,9 @@ TLSOC Reporting is one component of TLSOC, the open-source Security Operations P
 | Repository | Purpose |
 |---|---|
 | [tlsoc](https://github.com/sankettaware16/tlsoc) | Ecosystem home — documentation, architecture, roadmap |
-| [tlsoc-engine](https://github.com/sankettaware16/tlsoc-engine) | Log parsing and ECS normalization engine |
-| [tlsoc-docker-deploy](https://github.com/sankettaware16/tlsoc-docker-deploy) | TLS-secured core stack (Kafka, Logstash, Elasticsearch, Kibana) |
-| **tlsoc-reporting** (this repository) | Declarative executive reporting (HTML/PDF) |
+| [foss-soc-engine](https://github.com/sankettaware16/foss-soc-engine) | Log parsing and ECS normalization engine |
+| [TLSOCDockerDeploy](https://github.com/sankettaware16/TLSOCDockerDeploy) | TLS-secured core stack (Kafka, Logstash, Elasticsearch, Kibana) |
+| **tlsoc-reporting-framework** (this repository) | Declarative executive reporting (HTML/PDF) |
 
 ## Roadmap
 
@@ -266,7 +265,7 @@ Free and open-source software under the [Apache License 2.0](LICENSE).
 
 <p align="center">
   <a href="https://github.com/sankettaware16/tlsoc">TLSOC</a> •
-  <a href="https://github.com/sankettaware16/tlsoc-engine">Engine</a> •
-  <a href="https://github.com/sankettaware16/tlsoc-docker-deploy">Deploy</a> •
-  <a href="https://github.com/sankettaware16/tlsoc-reporting">Reporting</a>
+  <a href="https://github.com/sankettaware16/foss-soc-engine">Engine</a> •
+  <a href="https://github.com/sankettaware16/TLSOCDockerDeploy">Deploy</a> •
+  <a href="https://github.com/sankettaware16/tlsoc-reporting-framework">Reporting</a>
 </p>

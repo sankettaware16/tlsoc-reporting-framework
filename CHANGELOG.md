@@ -10,8 +10,8 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Joined the unified TLSOC ecosystem: standardized README, branding, and
-  cross-repository links. Canonical repository name is now `tlsoc-reporting`
-  (previously `tlsoc-reporting-framework`).
+  cross-repository links. The component is presented as **TLSOC Reporting**;
+  the repository name (`tlsoc-reporting-framework`) is unchanged.
 - Documentation reorganized into `docs/`: configuration guide, automation
   guide, and framework architecture.
 

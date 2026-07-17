@@ -37,5 +37,5 @@ Shipped and maintained:
 
 ## Proposing changes
 
-Open a [feature request](https://github.com/sankettaware16/tlsoc-reporting/issues) using the template. Roadmap changes land
+Open a [feature request](https://github.com/sankettaware16/tlsoc-reporting-framework/issues) using the template. Roadmap changes land
 here via pull request.

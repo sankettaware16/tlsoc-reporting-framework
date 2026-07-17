@@ -18,15 +18,14 @@ auto-detected deployment → built-in defaults.**
 ### On a TLSOC stack host (auto-detection)
 
 If the host runs
-[tlsoc-docker-deploy](https://github.com/sankettaware16/tlsoc-docker-deploy),
+[TLSOCDockerDeploy](https://github.com/sankettaware16/TLSOCDockerDeploy),
 the Elasticsearch host, password, and CA certificate are read from the
 deployment itself. Auto-detection looks in `/opt/TLSOCDockerDeploy` by default;
-if your stack lives elsewhere (for example a new clone at
-`/opt/tlsoc-docker-deploy`), set:
+if your stack lives elsewhere, set:
 
 ```yaml
 tlsoc_deploy:
-  dir: "/opt/tlsoc-docker-deploy"
+  dir: "/path/to/TLSOCDockerDeploy"
 ```
 
 ### Manual configuration (any other machine)

@@ -18,7 +18,7 @@ crontab -e
 
 ```cron
 # Generate all daily reports at 06:10 every morning
-10 6 * * * /opt/tlsoc-reporting/scripts/daily_reports.sh
+10 6 * * * /opt/tlsoc-reporting-framework/scripts/daily_reports.sh
 ```
 
 (Adjust the path to wherever the repository is cloned.)

@@ -58,8 +58,8 @@ transform, or widget is genuinely required, and open an issue to discuss it.
 ## Development setup
 
 ```bash
-git clone https://github.com/sankettaware16/tlsoc-reporting.git
-cd tlsoc-reporting
+git clone https://github.com/sankettaware16/tlsoc-reporting-framework.git
+cd tlsoc-reporting-framework
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m framework list      # no Elasticsearch needed
