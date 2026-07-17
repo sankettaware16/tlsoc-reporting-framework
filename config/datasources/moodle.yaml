@@ -1,0 +1,65 @@
+# ===========================================================================
+# Datasource: Moodle LMS front-end (Apache access logs via foss-soc-engine).
+#
+# Same profile as nginx (web_access), so the same web_daily report renders
+# for it - the differences live entirely in this file:
+#   * different index
+#   * no service.name / host.name in the documents  -> those logical fields
+#     are simply not mapped; dependent sections are omitted automatically
+#   * Moodle-specific auth surface (login/index.php, token endpoints)
+#   * Moodle serves its OWN application trees that would otherwise trip
+#     generic signatures (e.g. /lib/ajax/*.php)
+#
+# NOTE: verify the .keyword suffixes against your live moodle index once
+# (GET /<index>/_mapping) - dynamic mappings sometimes differ per module.
+# ===========================================================================
+name: moodle
+label: "Moodle LMS (moodle.iitb.ac.in)"
+profile: web_access
+index: "fosstlsoc-logs-moodle*"
+
+fields:
+  timestamp: "@timestamp"
+  client_ip: "source.ip"
+  status_code: "http.response.status_code"
+  response_bytes: "http.response.body.bytes"
+  url_path: "url.path"
+  url_query: "url.query"
+  method: "http.request.method.keyword"
+  referrer: "http.request.referrer.keyword"
+  user_agent: "user_agent.original.keyword"
+  geo_country: "source.geo.country_name"
+  geo_city: "source.geo.city_name"
+  # service / vhost intentionally unmapped: single-site host.
+
+params:
+  # Moodle's own application trees - first-party, never probes.
+  extra_benign_path_prefixes:
+    - "/lib/"
+    - "/theme/"
+    - "/pluginfile.php"
+    - "/draftfile.php"
+    - "/webservice/"
+    - "/course/"
+    - "/mod/"
+    - "/blocks/"
+    - "/pix/"
+    - "/grade/"
+    - "/user/pix.php"
+    - "/calendar/"
+    - "/my/"
+    - "/login/"
+
+  # Moodle authentication + web-service token surface.
+  auth_path_patterns:
+    - "/login/index.php*"
+    - "/login/token.php*"
+    - "/login/forgot_password.php*"
+    - "/admin*"
+    - "/webservice/rest/server.php*"
+
+  # LMS traffic is dominated by logged-in students; a single busy lab NAT
+  # can legitimately exceed the generic threshold.
+  suspicious_ip_threshold: 2000
+
+  internal_cidrs: []
