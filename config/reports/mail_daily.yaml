@@ -1,0 +1,330 @@
+# ===========================================================================
+# REPORT: Daily Mail Flow & Security  (profile: mail -> postfix et al.)
+# ===========================================================================
+name: mail_daily
+title: "Daily Mail Flow & Security Report"
+profile: mail
+description: >
+  Executive daily report for SMTP relay logs: volume, senders, recipients,
+  external destinations, relay usage, delivery outcomes and authentication.
+
+_defs:
+  failed_delivery: &failed_delivery
+    {field: outcome, in: [bounced, deferred, rejected, failed, error]}
+
+params:
+  window_hours: 24
+  top_n: 10
+  bounce_rate_warn: 2.0            # % failed deliveries -> amber badge
+  bounce_rate_crit: 10.0
+  prev_window_min_ratio: 0.5
+
+queries:
+  total_emails: {kind: count}
+  total_volume: {kind: sum, field: message_size, optional: true}
+  unique_senders: {kind: cardinality, field: sender}
+  unique_recipients: {kind: cardinality, field: recipient}
+
+  hourly:
+    kind: date_histogram
+    interval: hour
+    sub_aggs:
+      senders: {kind: cardinality, field: sender}
+
+  top_senders:
+    kind: terms
+    field: sender
+    size: $top_n
+    sub_aggs:
+      volume: {kind: sum, field: message_size}
+      recipients: {kind: cardinality, field: recipient}
+
+  top_recipients: {kind: terms, field: recipient, size: $top_n}
+
+  external_domains:
+    kind: terms
+    field: recipient_domain
+    size: $top_n
+    optional: true
+    filter: {field: external_recipient, equals: true}
+
+  relay_hosts:
+    kind: terms
+    field: relay_host
+    size: $top_n
+    optional: true
+
+  smtp_hosts:
+    kind: terms
+    field: smtp_host
+    size: $top_n
+    optional: true
+
+  outcomes: {kind: terms, field: outcome, size: 10, optional: true}
+  failed_total: {kind: count, filter: *failed_delivery, optional: true}
+
+  failed_senders:
+    kind: terms
+    field: sender
+    size: $top_n
+    optional: true
+    filter: *failed_delivery
+    sub_aggs:
+      dsn: {kind: top_terms, field: dsn, size: 2}
+
+  source_ips:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    sub_aggs:
+      country: {kind: top_terms, field: geo_country, size: 1}
+      users: {kind: cardinality, field: sasl_user}
+    transforms:
+      - classify_ip: {}
+
+  countries:
+    kind: terms
+    field: geo_country
+    size: $top_n
+    missing: "Unresolved"
+    optional: true
+
+  sasl_users:
+    kind: terms
+    field: sasl_user
+    size: $top_n
+    optional: true
+    sub_aggs:
+      ips: {kind: cardinality, field: client_ip}
+      top_ip: {kind: top_terms, field: client_ip, size: 1}
+
+  external_mail_total:
+    kind: count
+    optional: true
+    filter: {field: external_recipient, equals: true}
+
+  prev_total: {kind: count, window: previous}
+
+computed:
+  - {name: total, expr: "q.total_emails or 0"}
+  - {name: failed, expr: "q.failed_total or 0"}
+  - {name: failure_rate, expr: "pct(c.failed, c.total)"}
+  - {name: external_share, expr: "pct(q.external_mail_total or 0, c.total)"}
+  - name: prev_reliable
+    expr: "(q.prev_total or 0) >= c.total * params.prev_window_min_ratio
+           and (q.prev_total or 0) > 0"
+  - name: delta_emails
+    expr: "delta_pct(c.total, q.prev_total) if c.prev_reliable else None"
+  - name: data_warning
+    expr: "None if c.prev_reliable or c.total == 0 else
+           'Previous window logged only ' ~ human_int(q.prev_total) ~
+           ' messages against ' ~ human_int(c.total) ~ ' now — trend
+           comparison suppressed (likely ingest gap).'"
+
+badges:
+  - id: delivery
+    label: "Delivery health"
+    levels:
+      - {when: "c.failure_rate >= params.bounce_rate_crit",
+         text: CRITICAL, color: red}
+      - {when: "c.failure_rate >= params.bounce_rate_warn",
+         text: DEGRADED, color: amber}
+      - {text: HEALTHY, color: green}
+
+insights:
+  - when: "c.total == 0"
+    stop: true
+    text: >
+      No mail traffic was recorded in the reporting window. Verify the log
+      pipeline and that {{ ds.index }} is receiving documents.
+
+  - text: >
+      {{ human_int(c.total) }} messages processed from
+      {{ human_int(q.unique_senders) }} distinct senders to
+      {{ human_int(q.unique_recipients) }} distinct recipients
+      {%- if q.total_volume %} ({{ human_bytes(q.total_volume) }} total
+      volume){% endif %}
+      {%- if c.delta_emails is not none %}
+      ({{ "▲" if c.delta_emails > 0 else "▼" }}
+      {{ "%.1f" | format(c.delta_emails | abs) }}% vs previous
+      {{ window.hours }}h){% endif %}.
+
+  - when: "q.top_senders"
+    text: >
+      {{ q.top_senders[0].key }} generated
+      {{ "%.1f" | format(pct(q.top_senders[0].count, c.total)) }}% of total
+      mail traffic ({{ human_int(q.top_senders[0].count) }} messages to
+      {{ human_int(q.top_senders[0].recipients) }} distinct recipients).
+
+  - when: "q.external_domains"
+    text: >
+      {{ "%.1f" | format(c.external_share) }}% of messages left the
+      organisation; the most contacted external domain was
+      {{ q.external_domains[0].key }} with
+      {{ human_int(q.external_domains[0].count) }} deliveries.
+
+  - when: "q.relay_hosts"
+    text: >
+      Relay {{ q.relay_hosts[0].key }} carried
+      {{ "%.1f" | format(pct(q.relay_hosts[0].count, c.total)) }}% of
+      traffic.
+
+  - when: "c.failed > 0"
+    text: >
+      {{ human_int(c.failed) }} deliveries failed
+      ({{ "%.2f" | format(c.failure_rate) }}%): bounced, deferred or
+      rejected. The senders behind the failures are listed under Delivery
+      Outcomes.
+
+  - when: "q.hourly"
+    text: >
+      {% set peak = q.hourly | max(attribute='count') %}
+      Peak mail activity was around {{ peak.label }}
+      {{ window.tz_label }} with {{ human_int(peak.count) }} messages in
+      the hour.
+
+  - when: "q.sasl_users"
+    text: >
+      {{ q.sasl_users | length }} authenticated (SASL) accounts submitted
+      mail; the most active was {{ q.sasl_users[0].key }} with
+      {{ human_int(q.sasl_users[0].count) }} messages from
+      {{ human_int(q.sasl_users[0].ips) }} source IP(s).
+
+actions:
+  - when: "c.failure_rate >= params.bounce_rate_warn"
+    priority: P2
+    owner: "Mail team"
+    text: >
+      Delivery failure rate is {{ "%.2f" | format(c.failure_rate) }}%
+      ({{ human_int(c.failed) }} messages). Review the failed-sender table
+      and the relay queues; sustained deferrals often mean an upstream
+      block-list entry.
+
+  - when: "q.sasl_users and q.sasl_users[0].ips > 3"
+    priority: P2
+    owner: "SOC"
+    text: >
+      Account {{ q.sasl_users[0].key }} submitted mail from
+      {{ human_int(q.sasl_users[0].ips) }} different source IPs in
+      {{ window.hours }}h — verify this matches expected usage
+      (shared service account vs a compromised mailbox).
+
+  - when: "q.top_senders and pct(q.top_senders[0].count, c.total) > 40"
+    priority: P3
+    owner: "Mail team"
+    text: >
+      A single sender ({{ q.top_senders[0].key }}) generated
+      {{ "%.1f" | format(pct(q.top_senders[0].count, c.total)) }}% of all
+      mail. If this is not a known bulk sender, check for a runaway job or
+      abuse.
+
+sections:
+  - {type: heading, title: "Executive summary"}
+  - {type: insights}
+
+  - type: kpi_row
+    items:
+      - {label: "Messages", value: "c.total", format: int,
+         delta: "c.delta_emails"}
+      - {label: "Distinct senders", value: "q.unique_senders", format: int}
+      - {label: "Distinct recipients", value: "q.unique_recipients",
+         format: int}
+      - {label: "Delivery failures", value: "c.failed", format: int,
+         style: "'crit' if c.failure_rate >= params.bounce_rate_crit else
+                 ('warn' if c.failure_rate >= params.bounce_rate_warn
+                 else 'ok')",
+         foot: "{{ '%.2f' | format(c.failure_rate) }}% of traffic"}
+
+  - {type: heading, title: "Mail flow"}
+  - type: timeseries
+    title: "Messages per hour"
+    query: hourly
+    series_label: "messages / hour"
+
+  - type: row
+    left:
+      type: bars
+      title: "Top senders"
+      query: top_senders
+      color: navy
+    right:
+      type: bars
+      title: "Top recipients"
+      query: top_recipients
+      color: teal
+
+  - type: table
+    title: "Top senders — volume detail"
+    query: top_senders
+    columns:
+      - {key: key, label: "Sender", max: 44}
+      - {key: count, label: "Messages", format: int}
+      - {key: recipients, label: "Recipients", format: int}
+      - {key: volume, label: "Volume", format: bytes}
+
+  - type: row
+    left:
+      type: bars
+      title: "Top external destination domains"
+      query: external_domains
+      color: blue
+    right:
+      type: bars
+      title: "Relay / gateway usage"
+      query: relay_hosts
+      color: sky
+
+  - {type: heading, title: "Delivery outcomes"}
+  - type: row
+    left:
+      type: bars
+      title: "Outcome breakdown"
+      query: outcomes
+      color: green
+      show_pct: true
+    right:
+      type: bars
+      title: "SMTP hosts"
+      query: smtp_hosts
+      color: navy
+
+  - type: table
+    title: "Senders with failed deliveries"
+    query: failed_senders
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Sender", max: 44}
+      - {key: count, label: "Failures", format: int}
+      - {key: dsn, label: "DSN codes"}
+
+  - {type: heading, title: "Submission sources & authentication"}
+  - type: table
+    title: "Source IPs"
+    query: source_ips
+    columns:
+      - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: location, label: "Location", max: 22}
+      - {key: count, label: "Messages", format: int}
+      - {key: users, label: "SASL users", format: int}
+
+  - type: table
+    title: "Authenticated (SASL) submitters"
+    query: sasl_users
+    hide_if_empty: true
+    note: "An account submitting from many IPs, or from EXTERNAL space,
+           is the classic compromised-mailbox signature."
+    columns:
+      - {key: key, label: "Account", format: mono}
+      - {key: count, label: "Messages", format: int}
+      - {key: ips, label: "Distinct IPs", format: int}
+      - {key: top_ip, label: "Top source", format: mono, width: 104, nowrap: true}
+
+  - type: bars
+    title: "Source countries"
+    query: countries
+    color: teal
+
+  - {type: heading, title: "Recommended actions"}
+  - {type: actions}

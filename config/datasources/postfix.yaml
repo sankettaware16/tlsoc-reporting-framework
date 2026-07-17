@@ -1,0 +1,29 @@
+# ===========================================================================
+# Datasource: Postfix mail relay (parsed + correlated by foss-soc-engine).
+# Field names follow the engine's postfix module output (email.* ECS-style
+# tree). Adjust .keyword suffixes after checking your live index mapping.
+# ===========================================================================
+name: postfix
+label: "Mail Infrastructure (Postfix SMTP)"
+profile: mail
+index: "fosstlsoc-logs-mail_postfix*"
+
+fields:
+  timestamp: "@timestamp"
+  sender: "email.from.address"
+  recipient: "email.to.address"
+  sender_domain: "email.sender_domain"
+  recipient_domain: "email.recipient_domain"
+  external_recipient: "email.external_recipient"
+  internal_sender: "email.internal_sender"
+  relay_host: "email.relay.hostname"
+  message_size: "email.size"
+  dsn: "email.dsn"
+  outcome: "event.outcome"
+  client_ip: "source.ip"
+  smtp_host: "host.name"
+  sasl_user: "user.name"
+  auth_method: "authentication.method"
+  geo_country: "source.geo.country_name"
+
+params: {}
