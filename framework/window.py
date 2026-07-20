@@ -40,8 +40,17 @@ class Window:
 
     @property
     def date(self):
-        """Report date = local date of the window end."""
-        return self.local(self.end).date()
+        """
+        Report date = local date of the LAST MOMENT the window covers.
+
+        The end bound is exclusive, so using it directly mislabels any
+        window that ends exactly at midnight: `--window-end 2026-07-17T23:59`
+        covers all of the 17th but would be filed under the 18th. Stepping
+        back one second names the report after the day whose data it
+        actually contains, and leaves ordinary runs (window ending mid-day)
+        unchanged.
+        """
+        return self.local(self.end - datetime.timedelta(seconds=1)).date()
 
 
 def resolve_window(hours=24, tz_name="UTC", tz_label=None, end=None):

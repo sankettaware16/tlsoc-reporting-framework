@@ -7,6 +7,12 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Reports are now named after the day their data actually covers. A window
+  ending exactly at midnight (`--window-end 2026-07-17T23:59`) was filed
+  under the following date; ordinary scheduled runs are unaffected.
+
 ### Changed
 
 - Joined the unified TLSOC ecosystem: standardized README, branding, and
