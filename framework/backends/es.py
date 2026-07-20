@@ -224,11 +224,17 @@ class ESBackend:
         return normalize_signature_rows(cq, buckets, self._flatten)
 
     def _run_samples(self, cq):
+        # _source holds the ORIGINAL document, which has no .keyword
+        # subfields - those exist only in the inverted index. Requesting
+        # "url.path.keyword" here matches nothing and the column renders
+        # empty, so strip the suffix for source filtering.
+        source_fields = sorted({_source_name(f)
+                                for f in cq.sample_fields.values()})
         body = {
             "size": cq.size,
             "track_total_hits": False,
             "sort": [{self.ts_field: {"order": "desc"}}],
-            "_source": list(cq.sample_fields.values()),
+            "_source": source_fields,
             "query": self._query(cq),
         }
         res = self._search(body)
@@ -242,10 +248,14 @@ class ESBackend:
         return rows
 
 
+def _source_name(field):
+    """Aggregatable field name -> the name it has in _source."""
+    return field[: -len(".keyword")] if field.endswith(".keyword") else field
+
+
 def _dig(doc, dotted):
     """Fetch a dotted path from a nested dict; tolerate .keyword suffixes."""
-    if dotted.endswith(".keyword"):
-        dotted = dotted[: -len(".keyword")]
+    dotted = _source_name(dotted)
     cur = doc
     for part in dotted.split("."):
         if isinstance(cur, dict):

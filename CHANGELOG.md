@@ -7,11 +7,21 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `framework check-fields` — verifies a datasource's field map against the
+  live Elasticsearch mapping and names the exact `.keyword` suffix to use.
+  Turns field-mapping mistakes into an explicit pre-flight check instead of
+  an empty table in a generated report.
+
 ### Fixed
 
 - Reports are now named after the day their data actually covers. A window
   ending exactly at midnight (`--window-end 2026-07-17T23:59`) was filed
   under the following date; ordinary scheduled runs are unaffected.
+- Evidence-sample tables rendered `-` for any field mapped with a
+  `.keyword` suffix: `_source` filtering used the aggregatable field name,
+  which does not exist in the stored document.
 
 ### Changed
 

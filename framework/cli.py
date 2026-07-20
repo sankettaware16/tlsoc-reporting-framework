@@ -14,6 +14,7 @@ import argparse
 import datetime
 import sys
 
+from .backends import ESBackend
 from .generate import GenerateError, generate
 from .queryspec import (QueryContext, SpecError, UnmappedFieldError,
                         compile_query)
@@ -113,6 +114,57 @@ def _run_one(rep_name, ds_name, args, settings, registry):
     return result
 
 
+def cmd_check_fields(args):
+    """
+    Verify each datasource's field map against the LIVE mapping.
+
+    This is the fastest way to onboard a new log source: declare the
+    fields, run this, and it says exactly which ones need a .keyword
+    suffix instead of failing later with an empty table.
+    """
+    from .mapping import FIX, MISSING, OK, UNUSABLE, check_datasource
+
+    settings = load_settings()
+    registry = Registry()
+    names = [args.datasource] if args.datasource else sorted(
+        registry.datasources)
+    problems = 0
+
+    for name in names:
+        ds = registry.datasources.get(name)
+        if ds is None:
+            print(f"ERROR: unknown datasource '{name}'")
+            return 1
+        print(f"\n=== {ds.name} ({ds.index}) ===")
+        try:
+            window = resolve_window(24, settings["locale"]["timezone"],
+                                    settings["locale"]["tz_label"])
+            backend = ESBackend(settings, ds, window)
+            rows, index_count = check_datasource(backend.es, ds)
+        except Exception as e:  # noqa: BLE001 - report, never traceback
+            print(f"  could not read mapping: {e}")
+            problems += 1
+            continue
+
+        print(f"  {index_count} index(es) matched")
+        for r in rows:
+            if r["status"] == OK and not args.all:
+                continue
+            print(f"  [{r['status']:>7}] {r['logical']:<18} "
+                  f"{r['concrete']:<38} {r['detail']}")
+            if r["suggestion"]:
+                print(f"            -> set  {r['logical']}: "
+                      f"\"{r['suggestion']}\"")
+        bad = [r for r in rows if r["status"] in (FIX, MISSING, UNUSABLE)]
+        if bad:
+            problems += len(bad)
+            print(f"  {len(bad)} field(s) need attention, "
+                  f"{len(rows) - len(bad)} OK")
+        else:
+            print(f"  all {len(rows)} mapped fields verified")
+    return 1 if problems else 0
+
+
 def cmd_generate(args):
     settings = load_settings()
     registry = Registry()
@@ -149,6 +201,14 @@ def main(argv=None):
     sub.add_parser("validate",
                    help="compile all reports against all datasources")
 
+    cf = sub.add_parser("check-fields",
+                        help="verify datasource field maps against the "
+                             "live Elasticsearch mapping")
+    cf.add_argument("--datasource", default=None,
+                    help="one datasource (default: all)")
+    cf.add_argument("--all", action="store_true",
+                    help="also list fields that are already correct")
+
     def add_common(sp):
         sp.add_argument("--backend", choices=["es", "local"], default="es")
         sp.add_argument("--sample", action="append",
@@ -174,6 +234,7 @@ def main(argv=None):
 
     args = p.parse_args(argv)
     return {"list": cmd_list, "validate": cmd_validate,
+            "check-fields": cmd_check_fields,
             "generate": cmd_generate,
             "generate-all": cmd_generate_all}[args.cmd](args)
 
