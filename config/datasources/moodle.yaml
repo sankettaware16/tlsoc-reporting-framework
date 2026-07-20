@@ -36,6 +36,18 @@ fields:
   # service / vhost intentionally unmapped: single-site host.
 
 params:
+  # Load balancers, reverse proxies and monitoring in front of this estate.
+  # Excluded from volume-anomaly flagging only: their request volume is
+  # expected, and left in they occupy the top of that table every day.
+  # They still appear in the traffic, bandwidth and error tables.
+  # infrastructure_cidrs:
+  #   - "10.99.1.82"          # front-end proxy / load balancer
+  #   - "10.99.99.158"        # internal monitor
+
+  # Campus/estate PUBLIC ranges, counted as internal alongside RFC-1918.
+  # internal_cidrs:
+  #   - "103.21.124.0/22"
+
   # Moodle's own application trees - first-party, never probes.
   extra_benign_path_prefixes:
     - "/lib/"

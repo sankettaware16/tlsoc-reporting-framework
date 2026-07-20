@@ -37,6 +37,15 @@ fields:
   # time, add:  vhost: "host.name"  and the per-vhost sections light up.
 
 params:
+  # Load balancers, reverse proxies and monitoring in front of this estate,
+  # excluded from volume-anomaly flagging (their volume is expected).
+  # infrastructure_cidrs:
+  #   - "10.0.0.0/24"
+
+  # Campus/estate PUBLIC ranges, counted as internal alongside RFC-1918.
+  # internal_cidrs:
+  #   - "103.21.124.0/22"
+
   # First-party application paths on THIS estate (Drupal). Extends the
   # report's benign allowlist so core assets never count as probes.
   extra_benign_path_prefixes:

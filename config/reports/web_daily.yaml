@@ -110,7 +110,25 @@ params:
     "95.108.": "YandexBot"
     "106.75.": "Sogou"
     "220.181.": "Baiduspider"
+  # Networks treated as INTERNAL. RFC-1918, loopback and link-local are
+  # always internal; add your estate's own public ranges per datasource
+  # via `internal_cidrs` so campus addresses are not counted as foreign.
   internal_cidrs: []
+  private_cidrs:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+    - "127.0.0.0/8"
+    - "169.254.0.0/16"
+    - "::1/128"
+    - "fc00::/7"
+    - "fe80::/10"
+
+  # Load balancers, reverse proxies, health checkers and other first-party
+  # infrastructure. Their request volume is expected, so they are excluded
+  # from volume-anomaly flagging (they still appear in the traffic tables).
+  # Accepts bare addresses or CIDRs; set per datasource.
+  infrastructure_cidrs: []
 
 # ---------------------------------------------------------------------------
 queries:
@@ -165,6 +183,20 @@ queries:
       - cluster_paths: {depth: 4, collect: [codes]}
       - limit: {size: $top_n}
 
+  # Which client errors, not just how many. A 4xx total is unactionable on
+  # its own: 400 (malformed), 401/403 (rejected), 404 (missing) and 429
+  # (throttled) have different owners and different fixes.
+  client_error_codes:
+    kind: terms
+    field: status_code
+    size: 12
+    optional: true
+    filter:
+      all:
+        - {field: status_code, range: {gte: 400, lt: 500}}
+        - none:
+            - {field: status_code, in_param: client_abort_codes}
+
   # -- 404 triage: probe / expected-by-design / genuinely broken ----------
   c404_total:
     kind: count
@@ -215,12 +247,28 @@ queries:
     missing: "(direct / none)"
     optional: true
 
+  # Geography of EXTERNAL traffic only. Internal addressing has no public
+  # geolocation, so leaving it in produces a large "Unresolved" bucket that
+  # outranks every real country and says nothing. Internal volume is
+  # reported separately by `internal_requests` below.
   countries:
     kind: terms
     field: geo_country
     size: $top_n
     missing: "Unresolved"
     optional: true
+    filter:
+      none:
+        - {field: client_ip, ip_in_param: private_cidrs}
+        - {field: client_ip, ip_in_param: internal_cidrs}
+
+  internal_requests:
+    kind: count
+    optional: true
+    filter:
+      any:
+        - {field: client_ip, ip_in_param: private_cidrs}
+        - {field: client_ip, ip_in_param: internal_cidrs}
 
   top_ips:
     kind: terms
@@ -237,6 +285,10 @@ queries:
       - classify_ip: {}
       - derive_pct: {num: errors, den: count, to: err_pct}
 
+  # Volume anomalies among CLIENTS. First-party infrastructure (load
+  # balancers, reverse proxies, monitoring) is excluded by configuration:
+  # its volume is expected by definition, and left in it occupies the top
+  # of the table every single day and buries real outliers.
   suspicious_ips:
     kind: terms
     field: client_ip
@@ -246,6 +298,9 @@ queries:
       city: {kind: top_terms, field: geo_city, size: 1}
       unique_paths: {kind: cardinality, field: url_path}
       errors: {kind: filter, filter: *real_errors}
+    filter:
+      none:
+        - {field: client_ip, ip_in_param: infrastructure_cidrs}
     transforms:
       - classify_ip: {}
       - derive_pct: {num: errors, den: count, to: err_pct}
@@ -509,14 +564,30 @@ insights:
       quiet-hour floor of {{ human_int(quiet.count) }} at
       {{ quiet.label }} {{ window.tz_label }}.
 
+  # External geography only, with the internal share stated separately -
+  # a combined figure is dominated by ungeolocatable private addressing
+  # and reads as though the largest "country" were unknown.
   - when: "q.countries and q.countries | length > 1"
     text: >
-      {{ q.countries[0].key }} accounted for
-      {{ "%.1f" | format(pct(q.countries[0].count, c.total)) }}% of
-      requests; the next largest sources were
+      {% set ext = q.countries | map(attribute='count') | sum %}
+      {% if q.internal_requests %}Internal networks generated
+      {{ "%.1f" | format(pct(q.internal_requests, c.total)) }}% of traffic.
+      Of externally-sourced requests, the{% else %}The{% endif %}
+      largest origins were
+      {{ q.countries[0].key }}
+      ({{ "%.1f" | format(pct(q.countries[0].count, ext)) }}%),
       {{ q.countries[1:4] | map(attribute='key') | join(', ') }}
       ({{ "%.1f" | format(pct(q.countries[1:4] | map(attribute='count')
-      | sum, c.total)) }}% combined).
+      | sum, ext)) }}% combined).
+
+  - when: "q.client_error_codes and q.client_error_codes | length > 1"
+    text: >
+      {% set top = q.client_error_codes[0] %}
+      Client errors were led by HTTP {{ top.key }}
+      ({{ human_int(top.count) }} requests,
+      {{ "%.1f" | format(pct(top.count, c.err_4xx)) }}% of all 4xx);
+      {{ q.client_error_codes[1:4] | map(attribute='key')
+         | join(', ') }} followed.
 
   - when: "(q.probe_total or 0) > 0"
     text: >
@@ -690,9 +761,14 @@ sections:
         - {label: "No status logged", expr: "c.unclassified", color: faint}
     right:
       type: bars
-      title: "Requests by source country"
+      title: "External traffic by source country"
       query: countries
       color: teal
+      note: "{{ human_int(q.internal_requests) }} request(s)
+             ({{ '%.1f' | format(pct(q.internal_requests, c.total)) }}%)
+             came from internal ranges and are excluded here - private
+             addressing has no public geolocation."
+      show_note_if: "q.internal_requests"
 
   - type: bars
     title: "Top requested paths"
@@ -707,10 +783,21 @@ sections:
 
   # ---- errors ---------------------------------------------------------------
   - {type: heading, title: "Errors & availability"}
-  - type: bars
-    title: "Top client-error (4xx) paths"
-    query: top_4xx_paths
-    color: amber
+  - type: row
+    left:
+      type: bars
+      title: "Client errors (4xx) by status code"
+      query: client_error_codes
+      color: amber
+      show_pct: true
+      note: "Each code has a different owner: 400 malformed requests,
+             401/403 rejected access, 404 missing resources,
+             405 wrong method, 429 rate-limited."
+    right:
+      type: bars
+      title: "Top client-error (4xx) paths"
+      query: top_4xx_paths
+      color: amber
 
   - type: table
     title: "Server errors (5xx), clustered by path prefix"
