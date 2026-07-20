@@ -27,6 +27,11 @@ def ir_to_dsl(ir):
         return {"term": {ir[1]: ir[2]}}
     if kind == "terms":
         return {"terms": {ir[1]: ir[2]}}
+    if kind == "ip_in":
+        # A terms query on an `ip`-mapped field accepts CIDR notation, so
+        # one clause covers both bare addresses and ranges. On a keyword-
+        # mapped field this raises, and the owning section degrades.
+        return {"terms": {ir[1]: ir[2]}}
     if kind == "wildcard":
         _, field, patterns, ci = ir
         clauses = [{"wildcard": {field: {"value": p, "case_insensitive": ci}}}

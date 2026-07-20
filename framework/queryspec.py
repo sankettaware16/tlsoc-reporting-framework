@@ -20,6 +20,9 @@ Leaf clauses (all take `field: <logical name>` unless noted):
     equals: <value>               exact match
     in: [v, ...]                  any of the values
     in_param: <param>             any of the values in a list param
+    ip_in_param: <param>          IP falls inside any CIDR/address in a list
+                                  param (needs an `ip`-mapped field; the
+                                  section degrades if the field is a keyword)
     wildcard: "<pat>" | [pats]    ES wildcard, case-insensitive by default
     wildcard_param: <param>       patterns from a list param, used verbatim
     contains_param: <param>       list param terms wrapped as *term*
@@ -162,6 +165,8 @@ def _compile_node(node, ctx):
         return ("terms", field, _as_list(node["in"]))
     if "in_param" in node:
         return ("terms", field, list(ctx.param(node["in_param"])))
+    if "ip_in_param" in node:
+        return ("ip_in", field, list(ctx.param(node["ip_in_param"])))
     if "wildcard" in node:
         return ("wildcard", field, _as_list(node["wildcard"]), ci)
     if "wildcard_param" in node:

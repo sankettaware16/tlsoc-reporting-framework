@@ -15,6 +15,7 @@ other-bucket, and "missing" handling on terms aggregations.
 """
 import datetime
 import fnmatch
+import ipaddress
 import json
 import re
 from collections import Counter, defaultdict
@@ -76,6 +77,28 @@ def ir_to_predicate(ir):
         vset = set(values) | {str(v) for v in values}
         return lambda doc: any(v in vset or str(v) in vset
                                for v in _values(doc, field))
+    if kind == "ip_in":
+        # Mirrors Elasticsearch's CIDR-aware terms query on an ip field, so
+        # offline previews classify addresses exactly like a live run.
+        _, field, cidrs = ir
+        nets = []
+        for entry in cidrs:
+            try:
+                nets.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                continue
+
+        def _in_nets(doc):
+            for v in _values(doc, field):
+                try:
+                    addr = ipaddress.ip_address(str(v))
+                except ValueError:
+                    continue
+                if any(addr in net for net in nets):
+                    return True
+            return False
+
+        return _in_nets
     if kind == "wildcard":
         _, field, patterns, ci = ir
         regexes = [_wc_regex(p, ci) for p in patterns]
