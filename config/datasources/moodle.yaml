@@ -23,15 +23,16 @@ fields:
   client_ip: "source.ip"
   status_code: "http.response.status_code"
   response_bytes: "http.response.body.bytes"
-  # On the live moodle indexes url.path is dynamically mapped as text
-  # (fielddata disabled), so aggregations must use the keyword subfield.
+  # These indexes are dynamically mapped, so every string field is text
+  # with a keyword subfield - aggregations must target the subfield.
+  # Verified with: python3 -m framework check-fields --datasource moodle
   url_path: "url.path.keyword"
-  url_query: "url.query"
+  url_query: "url.query.keyword"
   method: "http.request.method.keyword"
   referrer: "http.request.referrer.keyword"
   user_agent: "user_agent.original.keyword"
-  geo_country: "source.geo.country_name"
-  geo_city: "source.geo.city_name"
+  geo_country: "source.geo.country_name.keyword"
+  geo_city: "source.geo.city_name.keyword"
   # service / vhost intentionally unmapped: single-site host.
 
 params:
