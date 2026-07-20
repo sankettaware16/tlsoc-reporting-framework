@@ -10,6 +10,8 @@ Widget catalogue (section `type:`):
 
 Every section supports:
     show_if:            expression - section is dropped when falsy
+    show_note_if:       expression - the note is dropped when falsy, while
+                        the widget itself still renders
     skip_if_unmapped:   [logical fields] - dropped when the datasource
                         does not map them (graceful degradation)
 """
@@ -148,7 +150,11 @@ class SectionBuilder:
         sec["type"] = spec["type"]
         sec["title"] = self._text(spec.get("title", "")) or None
         sec["hint"] = self._text(spec.get("hint", "")) or None
-        sec["note"] = self._text(spec.get("note", "")) or None
+        if spec.get("show_note_if") is not None and \
+                not self._eval(spec["show_note_if"]):
+            sec["note"] = None
+        else:
+            sec["note"] = self._text(spec.get("note", "")) or None
         sec["half"] = half
         return sec
 
