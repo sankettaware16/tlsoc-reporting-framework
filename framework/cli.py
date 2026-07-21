@@ -146,6 +146,17 @@ def cmd_check_fields(args):
             problems += 1
             continue
 
+        # No index matched: every field then reports MISSING, which reads
+        # like 11 separate mapping errors when the real (single) problem is
+        # the index pattern - or simply that this estate does not carry
+        # this log source at all.
+        if index_count == 0:
+            print(f"  no index matches '{ds.index}' on this cluster - "
+                  f"check the pattern, or this log source is not present "
+                  f"here (field checks skipped)")
+            problems += 1
+            continue
+
         print(f"  {index_count} index(es) matched")
         for r in rows:
             if r["status"] == OK and not args.all:

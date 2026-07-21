@@ -14,12 +14,12 @@ fields:
   dest_port: "destination.port"
   bytes: "source.bytes"
   duration_ms: "event.duration"
-  cache_action: "event.action"
-  outcome: "event.outcome"
+  cache_action: "event.action.keyword"
+  outcome: "event.outcome.keyword"
   status_code: "http.response.status_code"
-  method: "http.request.method"
-  protocol: "network.protocol"
+  method: "http.request.method.keyword"
+  protocol: "network.protocol.keyword"
   proxy_host: "host.name"
-  original_destination: "squid.original_destination"
+  original_destination: "squid.original_destination.keyword"
 
 params: {}

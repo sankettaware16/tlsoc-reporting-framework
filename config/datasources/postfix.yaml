@@ -6,7 +6,7 @@
 name: postfix
 label: "Mail Infrastructure (Postfix SMTP)"
 profile: mail
-index: "fosstlsoc-logs-mail_postfix*"
+index: "fosstlsoc-logs-*postfix*"
 
 fields:
   timestamp: "@timestamp"
