@@ -2,6 +2,7 @@
 # REPORT: Daily Forward-Proxy Traffic  (profile: proxy -> squid et al.)
 # ===========================================================================
 name: proxy_daily
+slug: daily_proxy          # output filename prefix: <slug>_<datasource>_<date>
 title: "Daily Proxy Traffic & Security Report"
 profile: proxy
 description: >

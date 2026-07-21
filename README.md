@@ -155,8 +155,35 @@ python3 -m framework generate-all
 --formats html                      # skip PDF
 ```
 
-Reports land in `output/html/` and `output/pdf/` as
-`<report>_<datasource>_<date>.{html,pdf}`.
+### Output file naming
+
+Reports land in `output/html/` and `output/pdf/` under a fixed,
+machine-parsable convention:
+
+```
+<slug>_<datasource>_<YYYY-MM-DD>.{html,pdf}
+
+daily_web_nginx_2026-07-21.pdf
+daily_mail_postfix_2026-07-21.pdf
+daily_proxy_squid_2026-07-21.pdf
+```
+
+| Part | Meaning | Comes from |
+|---|---|---|
+| `slug` | Report kind and cadence — `daily_web`, `daily_mail`, `daily_proxy` | `slug:` in the report YAML |
+| `datasource` | Which log source produced it — `nginx`, `moodle`, `postfix`, `squid` | `name:` in the datasource YAML |
+| `YYYY-MM-DD` | The day the data covers (not the day it was generated) | reporting window |
+
+The `datasource` element is what keeps reports distinct when one report
+definition runs against several sources: `daily_web_nginx_…` and
+`daily_web_moodle_…` are the same report over different estates.
+
+**This convention is a contract, not cosmetic.** Automated delivery
+selects files by matching this pattern, so keep the slug stable: it is
+declared separately from the report's internal `name:` precisely so a
+report can be renamed without changing what lands on disk. When adding a
+report, give it a `slug:` following the same `<cadence>_<subject>` shape
+(e.g. `weekly_web`).
 
 ### Offline preview (no Elasticsearch)
 

@@ -2,6 +2,7 @@
 # REPORT: Daily Mail Flow & Security  (profile: mail -> postfix et al.)
 # ===========================================================================
 name: mail_daily
+slug: daily_mail          # output filename prefix: <slug>_<datasource>_<date>
 title: "Daily Mail Flow & Security Report"
 profile: mail
 description: >

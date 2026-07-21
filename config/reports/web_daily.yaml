@@ -16,6 +16,7 @@
 #   sections   the rendered layout, top to bottom
 # ===========================================================================
 name: web_daily
+slug: daily_web          # output filename prefix: <slug>_<datasource>_<date>
 title: "Daily Web Traffic & Security Report"
 profile: web_access
 description: >

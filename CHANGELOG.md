@@ -27,6 +27,14 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
   Turns field-mapping mistakes into an explicit pre-flight check instead of
   an empty table in a generated report.
 
+### Changed
+
+- Output files are named `<slug>_<datasource>_<date>` with cadence first —
+  `daily_web_nginx_2026-07-21.pdf`, `daily_mail_postfix_…`,
+  `daily_proxy_squid_…`. The slug is declared per report and is
+  independent of the report's internal name, so the on-disk convention
+  that automated delivery matches on stays stable across renames.
+
 ### Fixed
 
 - Reports are now named after the day their data actually covers. A window

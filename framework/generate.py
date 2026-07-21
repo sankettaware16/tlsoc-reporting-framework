@@ -164,7 +164,11 @@ def generate(report_name, datasource_name, *,
     html_dir = out_html_dir or settings["output"]["html_dir"]
     pdf_dir = out_pdf_dir or settings["output"]["pdf_dir"]
     os.makedirs(html_dir, exist_ok=True)
-    stem = f"{report.name}_{ds.name}_{window.date}"
+    # <slug>_<datasource>_<YYYY-MM-DD>. The slug defaults to the report
+    # name; reports set it explicitly so the on-disk naming stays stable
+    # even if a report is renamed. Downstream delivery matches on this
+    # pattern, so it is part of the contract, not a display detail.
+    stem = f"{report.slug}_{ds.name}_{window.date}"
     formats = formats or settings["output"].get("formats", ["html", "pdf"])
 
     result.html_path = os.path.join(html_dir, f"{stem}.html")

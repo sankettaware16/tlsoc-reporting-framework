@@ -112,6 +112,9 @@ class ReportDef:
         self.name = doc["name"]
         self.doc = doc
         self.profile = doc.get("profile")
+        # Filename slug, kept separate from the report name so output
+        # naming (which downstream delivery matches on) survives a rename.
+        self.slug = doc.get("slug", self.name)
         self.title = doc.get("title", self.name)
         self.description = doc.get("description", "")
         self.params = doc.get("params") or {}
