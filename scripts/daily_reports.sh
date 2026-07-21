@@ -11,8 +11,11 @@
 #   * prunes logs older than KEEP_DAYS
 #   * exits non-zero when generation failed (so cron can mail on failure)
 #
-# Cron example (daily at 06:10):
-#   10 6 * * *  /opt/TLSOCDockerDeploy/reporting/scripts/daily_reports.sh
+# Any arguments are passed through to `generate-all`, e.g.
+#   daily_reports.sh --window-hours 168
+#
+# Cron example (daily at 12:00):
+#   0 12 * * *  /opt/tlsoc-reporting-framework/scripts/daily_reports.sh
 # ---------------------------------------------------------------------------
 set -u
 
@@ -31,15 +34,36 @@ if [ -f "$BASE_DIR/.env" ]; then
     set +a
 fi
 
+# Prefer the project's own virtualenv. cron runs with a minimal PATH, so
+# relying on whatever `python3` resolves to is the usual reason a job that
+# works by hand fails at 12:00 with ModuleNotFoundError.
+if [ -x "$BASE_DIR/.venv/bin/python" ]; then
+    PYTHON="$BASE_DIR/.venv/bin/python"
+else
+    PYTHON="${PYTHON:-python3}"
+fi
+
+# Marker for "what did THIS run produce". It cannot be the log file: that
+# is appended to throughout the run, so it always ends up newer than the
+# reports and would list nothing.
+STAMP="$(mktemp)"
+trap 'rm -f "$STAMP"' EXIT
+
 {
     echo "==== report run started  $(date '+%F %T %Z') ===="
+    echo "interpreter: $PYTHON"
     cd "$BASE_DIR"
-    python3 -m framework generate-all
+    "$PYTHON" -m framework generate-all "$@"
     rc=$?
     if [ "$rc" -eq 0 ]; then
+        echo "generated this run:"
+        find "$BASE_DIR/output" -newer "$STAMP" -type f \
+             \( -name '*.pdf' -o -name '*.html' \) -printf '  %p\n' 2>/dev/null \
+             | sort || true
         echo "==== report run finished OK  $(date '+%F %T %Z') ===="
     else
         echo "==== report run FAILED (exit $rc)  $(date '+%F %T %Z') ===="
+        echo "     investigate the 'ERROR'/'warning' lines above."
     fi
 } >> "$LOG_FILE" 2>&1
 
