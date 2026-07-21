@@ -187,18 +187,49 @@ def cmd_generate(args):
     return 0
 
 
+def _datasource_present(settings, ds, window):
+    """
+    True if this cluster actually carries the datasource's indexes.
+
+    The config tree is shared across estates, so a deployment normally
+    defines more datasources than any single cluster holds. Without this
+    check the cron run generates an empty report full of query warnings
+    for every absent source. Unknown (e.g. the cluster is unreachable) is
+    treated as present, so a genuine outage still surfaces as an error
+    rather than being silently skipped.
+    """
+    try:
+        backend = ESBackend(settings, ds, window)
+        return bool(backend.es.indices.get_mapping(index=ds.index))
+    except Exception:
+        return True
+
+
 def cmd_generate_all(args):
     """Every runnable (report × datasource) pair - the cron entry point."""
     settings = load_settings()
     registry = Registry()
     failures = 0
+    skipped = []
+    probe_window = resolve_window(24, settings["locale"]["timezone"],
+                                  settings["locale"]["tz_label"])
+    present = {}
     for rep, ds in registry.pairs():
+        if args.backend == "es":
+            if ds.name not in present:
+                present[ds.name] = _datasource_present(settings, ds,
+                                                       probe_window)
+            if not present[ds.name]:
+                skipped.append(f"{rep.name} × {ds.name}")
+                continue
         print(f"--- {rep.name} × {ds.name} ---")
         try:
             _run_one(rep.name, ds.name, args, settings, registry)
         except GenerateError as e:
             print(f"ERROR: {e}")
             failures += 1
+    for pair in skipped:
+        print(f"--- {pair}: skipped, no matching index on this cluster")
     return 1 if failures else 0
 
 

@@ -97,6 +97,8 @@ def generate(report_name, datasource_name, *,
     # -- queries --------------------------------------------------------------
     qctx = QueryContext(ds, registry.signatures, params, window)
     q = {}
+    attempted = failed = 0
+    first_failure = None
     for name, spec in report.queries.items():
         try:
             cq = compile_query(name, spec, qctx)
@@ -112,13 +114,26 @@ def generate(report_name, datasource_name, *,
         except SpecError as e:
             raise GenerateError(f"report '{report.name}', query '{name}': "
                                 f"{e}") from e
+        attempted += 1
         try:
             rows = be.execute(cq)
             q[name] = apply_transforms(rows, cq.spec.get("transforms"),
                                        params)
         except Exception as e:  # noqa: BLE001 - a query must not kill the run
             q[name] = _empty_result(cq.kind)
+            failed += 1
+            first_failure = first_failure or str(e)
             result.warnings.append(f"Query '{name}' failed: {e}")
+
+    # An individual query failing degrades one section. EVERY query failing
+    # means the backend is unreachable or refusing us - the cluster is down,
+    # credentials expired, the CA no longer matches. Emitting a report then
+    # produces a document of zeros that reads as "no traffic, no attacks",
+    # which is far more dangerous unattended than no report at all.
+    if attempted and failed == attempted:
+        raise GenerateError(
+            f"all {attempted} queries failed - no report written. "
+            f"First error: {first_failure}")
 
     # -- rule engine ---------------------------------------------------------
     context = {
