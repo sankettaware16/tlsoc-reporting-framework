@@ -10,20 +10,29 @@ index: "fosstlsoc-logs-*postfix*"
 
 fields:
   timestamp: "@timestamp"
-  sender: "email.from.address"
-  recipient: "email.to.address"
-  sender_domain: "email.sender_domain"
-  recipient_domain: "email.recipient_domain"
+  sender: "email.from.address.keyword"
+  recipient: "email.to.address.keyword"
+  sender_domain: "email.sender_domain.keyword"
+  recipient_domain: "email.recipient_domain.keyword"
   external_recipient: "email.external_recipient"
   internal_sender: "email.internal_sender"
-  relay_host: "email.relay.hostname"
+  relay_host: "email.relay.hostname.keyword"
   message_size: "email.size"
-  dsn: "email.dsn"
-  outcome: "event.outcome"
+  dsn: "email.dsn.keyword"
+  outcome: "event.outcome.keyword"
   client_ip: "source.ip"
-  smtp_host: "host.name"
-  sasl_user: "user.name"
-  auth_method: "authentication.method"
+  # smtp_host: "host.name"   # not indexed here - see note below
+  sasl_user: "user.name.keyword"
+  auth_method: "authentication.method.keyword"
   geo_country: "source.geo.country_name"
+
+# The originating host (e.g. the specific mail or proxy server) is NOT
+# indexed on this estate: it appears only inside event.original and is
+# never extracted at parse time. The mapping above is therefore commented
+# out, so any section that groups by it is omitted rather than failing.
+#
+# To enable it, add a grok field for the hostname in the log pipeline,
+# then uncomment the line and re-run:
+#     python3 -m framework check-fields --datasource postfix
 
 params: {}
