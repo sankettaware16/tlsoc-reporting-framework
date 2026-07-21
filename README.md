@@ -200,10 +200,33 @@ them in the local, git-ignored `log_samples/` directory.
 
 ### Daily automation
 
-`scripts/daily_reports.sh` loads `.env`, runs `generate-all`, and writes per-day
-logs with automatic pruning — schedule it with cron and pair it with the
-[Report Emailer](TLSOC_Report_Emailer/README.md) for delivery. Full guide,
-including the failure-investigation table: [docs/automation.md](docs/automation.md).
+`scripts/daily_reports.sh` is the scheduled entry point: it finds the project
+virtualenv, generates every report this cluster can produce, and logs the run
+to `logs/reports_YYYY-MM-DD.log` with automatic pruning.
+
+```bash
+chmod +x scripts/daily_reports.sh
+./scripts/daily_reports.sh        # test by hand first
+crontab -e
+```
+
+```cron
+# Generate all daily reports at 12:00 noon
+0 12 * * * /opt/tlsoc-reporting-framework/scripts/daily_reports.sh
+```
+
+**Window:** by default each run covers the **last complete calendar day**
+(yesterday 00:00 → today 00:00 in the report timezone), whatever hour it
+runs — so the report always describes a whole day, and is dated for the day
+it describes rather than the day it ran.
+
+**To change the time**, edit the cron line; any hour works because the window
+follows the day, not the run time. Pick a time comfortably after midnight so
+the previous day is fully ingested. To use a rolling 24 hours ending at run
+time instead, set `REPORT_WINDOW_END=now`.
+
+Full guide — window options, log format and the failure-investigation table:
+[docs/automation.md](docs/automation.md).
 
 ## Repository Structure
 

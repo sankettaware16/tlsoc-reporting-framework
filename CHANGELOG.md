@@ -29,6 +29,10 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Scheduled runs now cover the **last complete calendar day** by default
+  instead of a rolling 24 hours ending at run time, so a daily report always
+  describes a whole day regardless of when the job fires. Override with
+  `REPORT_WINDOW_END=now` or an explicit `--window-end`.
 - Output files are named `<slug>_<datasource>_<date>` with cadence first —
   `daily_web_nginx_2026-07-21.pdf`, `daily_mail_postfix_…`,
   `daily_proxy_squid_…`. The slug is declared per report and is

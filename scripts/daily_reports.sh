@@ -34,6 +34,32 @@ if [ -f "$BASE_DIR/.env" ]; then
     set +a
 fi
 
+# --- reporting window ------------------------------------------------------
+# Default: the last COMPLETE calendar day (yesterday 00:00 -> today 00:00),
+# whatever time of day the job happens to run. A daily report should cover a
+# whole day: a rolling "last 24h from now" window straddles two dates, so the
+# same report means something different at 12:00 than at 06:00 and no run
+# ever covers a full day cleanly. The output is dated for the day it
+# describes, not the day it ran.
+#
+# Override for a rolling window ending at run time:
+#     REPORT_WINDOW_END=now ./daily_reports.sh
+# Or pass any generate-all flag explicitly, which takes precedence:
+#     ./daily_reports.sh --window-end 2026-07-10T00:00 --window-hours 168
+WINDOW_ARGS=()
+case " $* " in
+    *" --window-end "*) ;;                       # caller decides
+    *)
+        case "${REPORT_WINDOW_END:-midnight}" in
+            now|rolling) ;;                      # generate-all's own default
+            midnight)
+                WINDOW_ARGS=(--window-end "$(date +%F)T00:00") ;;
+            *)
+                WINDOW_ARGS=(--window-end "$REPORT_WINDOW_END") ;;
+        esac
+        ;;
+esac
+
 # Prefer the project's own virtualenv. cron runs with a minimal PATH, so
 # relying on whatever `python3` resolves to is the usual reason a job that
 # works by hand fails at 12:00 with ModuleNotFoundError.
@@ -52,8 +78,9 @@ trap 'rm -f "$STAMP"' EXIT
 {
     echo "==== report run started  $(date '+%F %T %Z') ===="
     echo "interpreter: $PYTHON"
+    echo "window args: ${WINDOW_ARGS[*]:-<generate-all default: rolling>} $*"
     cd "$BASE_DIR"
-    "$PYTHON" -m framework generate-all "$@"
+    "$PYTHON" -m framework generate-all "${WINDOW_ARGS[@]}" "$@"
     rc=$?
     if [ "$rc" -eq 0 ]; then
         echo "generated this run:"
