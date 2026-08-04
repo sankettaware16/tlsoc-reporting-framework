@@ -48,6 +48,25 @@ params:
   # internal_cidrs:
   #   - "103.21.124.0/22"
 
+  # Name for the site root and shared paths (everything under no area below).
+  main_site_name: "moodle.iitb.ac.in (core & shared)"
+
+  # Moodle functional subsystems, by URL path. Lets the report show which
+  # part of the LMS is being scanned / carrying traffic. These are Moodle's
+  # standard routes; adjust for local plugins. (Courses / modules / web
+  # services are also in the benign list below, so they appear in the
+  # traffic-by-area view but not as probes - which is correct: legitimate
+  # LMS activity, not scanning.)
+  site_areas:
+    - {name: "Login",                    prefix: "/login"}
+    - {name: "Authentication (SSO/OAuth)", prefix: "/auth"}
+    - {name: "Administration",           prefix: "/admin"}
+    - {name: "User Profiles",            prefix: "/user"}
+    - {name: "Web Services / API",       prefix: "/webservice"}
+    - {name: "Courses",                  prefix: "/course"}
+    - {name: "Activity Modules",         prefix: "/mod"}
+    - {name: "My Dashboard",             prefix: "/my"}
+
   # Moodle's own application trees - first-party, never probes.
   extra_benign_path_prefixes:
     - "/lib/"
