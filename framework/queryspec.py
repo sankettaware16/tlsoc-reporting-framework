@@ -193,7 +193,7 @@ def _compile_node(node, ctx):
 # ---------------------------------------------------------------------------
 SCALAR_KINDS = {"count", "cardinality", "sum", "avg", "min", "max"}
 BUCKET_KINDS = {"terms", "date_histogram", "range_buckets",
-                "signature_categories"}
+                "signature_categories", "path_groups"}
 ALL_KINDS = SCALAR_KINDS | BUCKET_KINDS | {"samples"}
 
 SUBAGG_KINDS = {"cardinality", "sum", "avg", "min", "max", "filter",
@@ -233,6 +233,25 @@ class CompiledQuery:
         if self.kind == "signature_categories":
             self.pack = ctx.signature_pack(spec["pack"])
             self.category_field = ctx.field(self.pack.target_field)
+
+        # path_groups: segment an estate by url-path prefix (site sections,
+        # API namespaces, tenant folders...). The prefix list is data - it
+        # comes from a datasource param via `groups_param`, or inline via
+        # `groups` - so the report definition stays estate-agnostic. Each
+        # group becomes one bucket; everything matching no prefix falls into
+        # `other_name`. General over any keyword/text field, not just URLs.
+        self.groups = []
+        self.other_name = spec.get("other_name", "_other")
+        if self.kind == "path_groups":
+            self.field = ctx.field(spec["field"])
+            if spec.get("groups_param"):
+                raw_groups = ctx.param(spec["groups_param"])
+            else:
+                raw_groups = spec.get("groups", [])
+            for g in (raw_groups or []):
+                name, prefix = g.get("name"), g.get("prefix")
+                if name and prefix:
+                    self.groups.append((name, prefix))
 
         self.sample_fields = None
         if self.kind == "samples":

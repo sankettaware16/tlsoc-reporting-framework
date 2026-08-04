@@ -88,6 +88,16 @@ params:
   # Login surface - datasources override with their app's real routes.
   auth_path_patterns: []
 
+  # Site areas: segment one web estate into the sections it serves, by
+  # URL-path prefix. When a proxy/CMS fronts many areas under one hostname
+  # (path-mounted sub-sites, tenant folders, API namespaces), this is what
+  # lets the report answer "which area is being scanned / is exposed".
+  # Each entry: {name, prefix}. Everything under no prefix is the main site.
+  # Left empty here; datasources that need it declare their own areas.
+  # Discover candidates on a live index with:
+  #   terms agg on url_path, or eyeball the top paths in a prior report.
+  site_areas: []
+
   # Automated-agent UA substrings, matched case-insensitively.
   bot_ua_terms:
     ["bot", "spider", "crawl", "scan", "curl", "wget", "python", "go-http",
@@ -366,6 +376,32 @@ queries:
     sub_aggs:
       ip: {kind: top_terms, field: client_ip, size: 1}
 
+  # Scanning & exposure per site area. path_groups buckets probe traffic by
+  # the configured site_areas prefixes (+ a main-site bucket for everything
+  # else), so the web team sees which section attackers targeted and which
+  # answered a probe with content. Empty site_areas -> no rows -> hidden.
+  area_probes:
+    kind: path_groups
+    field: url_path
+    groups_param: site_areas
+    other_name: "Main site (root & shared paths)"
+    filter: *threat_scope
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+      served: {kind: filter,
+               filter: {field: status_code, in_param: probe_success_codes}}
+      top_path: {kind: top_terms, field: url_path, size: 1}
+
+  # Overall traffic per site area, for context next to the probe view.
+  area_traffic:
+    kind: path_groups
+    field: url_path
+    groups_param: site_areas
+    other_name: "Main site (root & shared paths)"
+    sub_aggs:
+      visitors: {kind: cardinality, field: client_ip}
+      errors: {kind: filter, filter: *real_errors}
+
   probe_ips:
     kind: terms
     field: client_ip
@@ -624,6 +660,20 @@ insights:
       {{ human_int(q.probe_ips[0].count) }} probe requests across
       {{ human_int(q.probe_ips[0].unique_paths) }} distinct paths.
 
+  # Only when the estate declares site_areas. Names the most-scanned area
+  # and flags any area that answered a probe with content.
+  - when: "params.site_areas and q.area_probes"
+    text: >
+      {% set exposed = q.area_probes | selectattr('served', 'gt', 0)
+         | list %}
+      Most scanning targeted {{ q.area_probes[0].key }}
+      ({{ human_int(q.area_probes[0].count) }} probes).
+      {% if exposed %}Probes were answered with content in
+      {{ exposed | length }} area(s):
+      {{ exposed | map(attribute='key') | join(', ') }} — review under
+      Security Signals.{% else %}No site area answered a probe with
+      content.{% endif %}
+
   - when: "(q.bots_total or 0) > 0"
     text: >
       Automated agents (crawlers, scripted clients, monitoring) accounted
@@ -852,6 +902,23 @@ sections:
       - {key: top_path, label: "Most-hit path", format: mono, max: 40}
       - {key: top_ip, label: "Top source", format: mono, width: 104, nowrap: true}
 
+  - type: table
+    title: "Scanning & exposure by site area"
+    query: area_probes
+    show_if: "params.site_areas"
+    hide_if_empty: true
+    note: "Probe activity grouped by site section. 'Served 2xx' greater than
+           zero means a probe to that area was answered with content — confirm
+           those paths are intentional or block them at the proxy. Root-level
+           scans land in the main-site bucket. Areas are configured per
+           datasource (site_areas)."
+    columns:
+      - {key: key, label: "Site area", max: 34}
+      - {key: count, label: "Probes", format: int}
+      - {key: sources, label: "Sources", format: int}
+      - {key: served, label: "Served 2xx", format: int}
+      - {key: top_path, label: "Most-probed path", format: mono, max: 38}
+
   - type: bars
     title: "Most-probed paths"
     query: probe_paths
@@ -984,6 +1051,19 @@ sections:
       - {key: visitors, label: "Visitors", format: int}
       - {key: err_pct, label: "Err %", format: pct}
       - {key: bytes, label: "Bandwidth", format: bytes}
+
+  # Traffic split by site area (path-based) - the estate-segmentation view
+  # for deployments that serve many sections behind one host/service.
+  - type: table
+    title: "Traffic by site area"
+    query: area_traffic
+    show_if: "params.site_areas"
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Site area", max: 34}
+      - {key: count, label: "Requests", format: int}
+      - {key: visitors, label: "Visitors", format: int}
+      - {key: errors, label: "Errors", format: int}
 
   # ---- actions -----------------------------------------------------------------
   - {type: heading, title: "Recommended actions"}

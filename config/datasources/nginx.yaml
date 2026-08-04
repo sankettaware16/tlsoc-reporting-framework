@@ -46,6 +46,24 @@ params:
   # internal_cidrs:
   #   - "103.21.124.0/22"
 
+  # Site areas: this proxy fronts ONE Drupal estate (iitb.ac.in) whose
+  # sections are mounted under path prefixes. The logs carry no Host header,
+  # so the section a request targeted is only knowable from url.path - this
+  # list is what lets the report break scanning/exposure down by section.
+  # Add/rename freely; anything under no prefix is reported as the main site.
+  # To find more sections: look at the top url.path first-segments in a
+  # recent report, or run a terms agg on url.path.keyword.
+  site_areas:
+    - {name: "Dean (Planning)",        prefix: "/deanpl"}
+    - {name: "Women Students' Cell",   prefix: "/womenstudents"}
+    - {name: "Academic Section",       prefix: "/academichome"}
+    - {name: "New Academic Home",      prefix: "/newacadhome"}
+    - {name: "MEMS",                   prefix: "/mems"}
+    - {name: "Hospital",               prefix: "/hospital"}
+    - {name: "IPR Cell",               prefix: "/ipriks"}
+    - {name: "Career / Recruitment",   prefix: "/career"}
+    - {name: "Breaking News",          prefix: "/breaking-news"}
+
   # First-party application paths on THIS estate (Drupal). Extends the
   # report's benign allowlist so core assets never count as probes.
   extra_benign_path_prefixes:

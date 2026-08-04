@@ -331,6 +331,25 @@ class LocalBackend:
             return self._row(cq_, None, b["_docs"])
         return normalize_signature_rows(cq, raw, flatten)
 
+    def _run_path_groups(self, cq):
+        if not cq.groups:
+            return []
+        docs = self._select(cq)
+        rows = []
+        matched = set()
+        for name, prefix in cq.groups:
+            pred = ir_to_predicate(("prefix", cq.field, [prefix], True))
+            hit = [d for d in docs if pred(d)]
+            matched.update(id(d) for d in hit)
+            if hit:
+                rows.append(self._row(cq, name, hit))
+        if cq.other_bucket:
+            other = [d for d in docs if id(d) not in matched]
+            if other:
+                rows.append(self._row(cq, cq.other_name, other))
+        rows.sort(key=lambda r: -r["count"])
+        return rows
+
     def _run_samples(self, cq):
         docs = sorted(self._select(cq),
                       key=lambda d: d["_ts"] or datetime.datetime.min.replace(

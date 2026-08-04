@@ -109,6 +109,40 @@ blocks:
 Copy the closest file in `config/reports/`, rename, edit. It appears in
 `python3 -m framework list` on its own.
 
+## Segment one estate into site areas
+
+When a proxy or CMS serves many sections behind **one hostname** (path-mounted
+sub-sites, tenant folders, API namespaces), the web report can break traffic
+and — more importantly — scanning and exposure down **by section**, so a
+security finding points at the part of the site it concerns instead of one
+undifferentiated blob.
+
+The section a request targeted is read from the URL path, because that is
+usually the only signal a shared-host access log carries (there is often no
+Host header). Declare the areas in the **datasource**, by path prefix:
+
+```yaml
+# config/datasources/<name>.yaml
+params:
+  site_areas:
+    - {name: "Dean (Planning)",      prefix: "/deanpl"}
+    - {name: "Women Students' Cell", prefix: "/womenstudents"}
+    - {name: "Academic Section",     prefix: "/academichome"}
+```
+
+Anything under no listed prefix is reported as the main site. With `site_areas`
+set, the web report gains a **"Scanning & exposure by site area"** table
+(probes, distinct sources, probes answered with 2xx, most-probed path per
+area) and a **"Traffic by site area"** table; an executive-summary line names
+the most-scanned area and flags any that served a probe with content. Declare
+nothing and all of it stays hidden — no effect on estates that don't need it.
+
+To find an estate's areas, look at the top URL-path first-segments in a recent
+report, or run a terms aggregation on the path field.
+
+This is the general `path_groups` query kind — grouping any keyword/text field
+by a configured list of prefixes — so it is reusable beyond site sections.
+
 ## Extend detections
 
 Add categories/patterns to `config/signatures/web_threats.yaml` — every web

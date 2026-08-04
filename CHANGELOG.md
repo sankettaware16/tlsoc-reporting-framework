@@ -9,6 +9,15 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Site-area segmentation** for web reports. A datasource can declare
+  `site_areas` (name + URL-path prefix) to split one estate served behind a
+  single host into its sections; the report then breaks scanning and exposure
+  down per area — a "Scanning & exposure by site area" table (probes, sources,
+  probes served 2xx, most-probed path), a "Traffic by site area" table, and an
+  executive-summary line naming the most-scanned and any exposed area. Built on
+  a general `path_groups` query kind (group any field by configured prefixes),
+  so it is reusable beyond site sections. Estates that declare no areas are
+  unaffected — the sections stay hidden.
 - Source geography now reports **external** traffic only, with internal
   volume counted and stated separately — private addressing has no public
   geolocation and previously dominated the chart as "Unresolved".

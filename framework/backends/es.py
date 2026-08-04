@@ -228,6 +228,29 @@ class ESBackend:
         buckets = res["aggregations"]["out"]["buckets"]
         return normalize_signature_rows(cq, buckets, self._flatten)
 
+    def _run_path_groups(self, cq):
+        if not cq.groups:
+            return []
+        filters = {name: ir_to_dsl(("prefix", cq.field, [prefix], True))
+                   for name, prefix in cq.groups}
+        agg = {"filters": {"filters": filters}}
+        if cq.other_bucket:
+            agg["filters"]["other_bucket"] = True
+            agg["filters"]["other_bucket_key"] = cq.other_name
+        body = {"size": 0, "query": self._query(cq),
+                "aggs": {"out": {**agg, "aggs": self._subaggs_dsl(cq)}}}
+        res = self._search(body)
+        buckets = res["aggregations"]["out"]["buckets"]
+        rows = []
+        for key, b in buckets.items():
+            if not b.get("doc_count"):
+                continue
+            row = self._flatten(cq, b)
+            row["key"] = key
+            rows.append(row)
+        rows.sort(key=lambda r: -r["count"])
+        return rows
+
     def _run_samples(self, cq):
         # _source holds the ORIGINAL document, which has no .keyword
         # subfields - those exist only in the inverted index. Requesting
