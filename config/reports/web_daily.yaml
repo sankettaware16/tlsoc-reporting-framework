@@ -98,6 +98,12 @@ params:
   #   terms agg on url_path, or eyeball the top paths in a prior report.
   site_areas: []
 
+  # Label for everything under no site_areas prefix (the site root and any
+  # shared assets). Datasources should set this to the estate's real name -
+  # e.g. its primary hostname - so the report names the main site instead
+  # of a generic placeholder.
+  main_site_name: "Main site (root & shared paths)"
+
   # Automated-agent UA substrings, matched case-insensitively.
   bot_ua_terms:
     ["bot", "spider", "crawl", "scan", "curl", "wget", "python", "go-http",
@@ -384,7 +390,7 @@ queries:
     kind: path_groups
     field: url_path
     groups_param: site_areas
-    other_name: "Main site (root & shared paths)"
+    other_name: $main_site_name
     filter: *threat_scope
     sub_aggs:
       sources: {kind: cardinality, field: client_ip}
@@ -397,7 +403,7 @@ queries:
     kind: path_groups
     field: url_path
     groups_param: site_areas
-    other_name: "Main site (root & shared paths)"
+    other_name: $main_site_name
     sub_aggs:
       visitors: {kind: cardinality, field: client_ip}
       errors: {kind: filter, filter: *real_errors}

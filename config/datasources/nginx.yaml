@@ -53,6 +53,10 @@ params:
   # Add/rename freely; anything under no prefix is reported as the main site.
   # To find more sections: look at the top url.path first-segments in a
   # recent report, or run a terms agg on url.path.keyword.
+  # Name shown for the site root and shared paths (everything under no
+  # site_areas prefix). This estate is a single Drupal site.
+  main_site_name: "www.iitb.ac.in (main site)"
+
   site_areas:
     - {name: "Dean (Planning)",        prefix: "/deanpl"}
     - {name: "Women Students' Cell",   prefix: "/womenstudents"}
