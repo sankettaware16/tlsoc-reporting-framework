@@ -60,6 +60,31 @@ case " $* " in
         ;;
 esac
 
+# --- report date (label) ---------------------------------------------------
+# The report covers the previous full day but is ISSUED today, so it is
+# labelled with today's date (filename + the date shown on it). This is the
+# date a same-day delivery step looks for. The analysed window is unchanged
+# and still shown in full on the report.
+#
+#   REPORT_DATE=covered  -> label with the day the data covers (the previous
+#                           day) instead; useful if you file reports by the
+#                           day they describe.
+#   REPORT_DATE=YYYY-MM-DD -> an explicit label date.
+# An explicit --report-date on the command line always wins.
+DATE_ARGS=()
+case " $* " in
+    *" --report-date "*) ;;                      # caller decides
+    *)
+        case "${REPORT_DATE:-issue}" in
+            covered|window) ;;                   # framework default (window date)
+            issue|today)
+                DATE_ARGS=(--report-date "$(date +%F)") ;;
+            *)
+                DATE_ARGS=(--report-date "$REPORT_DATE") ;;
+        esac
+        ;;
+esac
+
 # Prefer the project's own virtualenv. cron runs with a minimal PATH, so
 # relying on whatever `python3` resolves to is the usual reason a job that
 # works by hand fails at 12:00 with ModuleNotFoundError.
@@ -78,9 +103,9 @@ trap 'rm -f "$STAMP"' EXIT
 {
     echo "==== report run started  $(date '+%F %T %Z') ===="
     echo "interpreter: $PYTHON"
-    echo "window args: ${WINDOW_ARGS[*]:-<generate-all default: rolling>} $*"
+    echo "window args: ${WINDOW_ARGS[*]:-<generate-all default: rolling>} ${DATE_ARGS[*]} $*"
     cd "$BASE_DIR"
-    "$PYTHON" -m framework generate-all "${WINDOW_ARGS[@]}" "$@"
+    "$PYTHON" -m framework generate-all "${WINDOW_ARGS[@]}" "${DATE_ARGS[@]}" "$@"
     rc=$?
     if [ "$rc" -eq 0 ]; then
         echo "generated this run:"

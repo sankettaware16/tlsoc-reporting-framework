@@ -297,7 +297,9 @@ def render_report(report, datasource, settings, window, context, sections):
             "label": window.label,
             "hours": window.hours,
             "tz_label": window.tz_label,
-            "date": window.date,
+            # The label date (filename + shown date) may be issue-dated,
+            # independent of the window; the window range above is the truth.
+            "date": context.get("window", {}).get("date", window.date),
         },
         generated_at=now_local.strftime("%d %b %Y, %H:%M ")
         + window.tz_label,

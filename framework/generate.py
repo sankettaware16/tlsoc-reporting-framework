@@ -49,7 +49,7 @@ class RunResult:
 def generate(report_name, datasource_name, *,
              settings=None, registry=None,
              backend="es", sample_paths=None,
-             window_hours=None, window_end=None,
+             window_hours=None, window_end=None, report_date=None,
              formats=None, cli_params=None,
              out_html_dir=None, out_pdf_dir=None):
     settings = settings or load_settings()
@@ -75,6 +75,14 @@ def generate(report_name, datasource_name, *,
     tz_name = settings["locale"]["timezone"]
     tz_label = settings["locale"]["tz_label"]
 
+    # The date that LABELS the report (filename + the date shown on it) can
+    # differ from the day the data covers. By default they are the same. A
+    # daily pipeline that runs after midnight to report on the prior full
+    # day may prefer to label the report with the ISSUE date (the day it is
+    # produced and sent) instead - `report_date` sets that, without changing
+    # the analysed window, which the report still shows in full.
+    label_date = report_date or None
+
     # -- backend ------------------------------------------------------------
     if backend == "local":
         if not sample_paths:
@@ -93,6 +101,9 @@ def generate(report_name, datasource_name, *,
     else:
         window = resolve_window(hours, tz_name, tz_label, end=window_end)
         be = ESBackend(settings, ds, window)
+
+    # Fall back to the window's own date when no explicit label date is given.
+    label_date = label_date or window.date
 
     # -- queries --------------------------------------------------------------
     qctx = QueryContext(ds, registry.signatures, params, window)
@@ -142,7 +153,7 @@ def generate(report_name, datasource_name, *,
         "params": params,
         "window": {
             "hours": window.hours, "label": window.label,
-            "tz_label": window.tz_label, "date": str(window.date),
+            "tz_label": window.tz_label, "date": str(label_date),
             "start": window.fmt_local(window.start),
             "end": window.fmt_local(window.end),
         },
@@ -183,7 +194,7 @@ def generate(report_name, datasource_name, *,
     # name; reports set it explicitly so the on-disk naming stays stable
     # even if a report is renamed. Downstream delivery matches on this
     # pattern, so it is part of the contract, not a display detail.
-    stem = f"{report.slug}_{ds.name}_{window.date}"
+    stem = f"{report.slug}_{ds.name}_{label_date}"
     formats = formats or settings["output"].get("formats", ["html", "pdf"])
 
     result.html_path = os.path.join(html_dir, f"{stem}.html")

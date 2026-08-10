@@ -97,11 +97,15 @@ def _run_one(rep_name, ds_name, args, settings, registry):
     window_end = None
     if args.window_end:
         window_end = datetime.datetime.fromisoformat(args.window_end)
+    report_date = None
+    if getattr(args, "report_date", None):
+        report_date = datetime.date.fromisoformat(args.report_date)
     result = generate(
         rep_name, ds_name,
         settings=settings, registry=registry,
         backend=args.backend, sample_paths=args.sample,
         window_hours=args.window_hours, window_end=window_end,
+        report_date=report_date,
         formats=args.formats.split(",") if args.formats else None,
         cli_params=_parse_params(args.param),
         out_html_dir=args.out_html, out_pdf_dir=args.out_pdf,
@@ -259,6 +263,11 @@ def main(argv=None):
         sp.add_argument("--window-end", default=None,
                         help="ISO timestamp; default: last complete hour "
                              "(ES) / newest sample doc (local)")
+        sp.add_argument("--report-date", default=None,
+                        help="YYYY-MM-DD to LABEL the report (filename and "
+                             "the date shown on it); default: the day the "
+                             "window covers. Use the run date to issue-date "
+                             "a report on the prior full day.")
         sp.add_argument("--formats", default=None, help="html,pdf")
         sp.add_argument("--param", action="append",
                         help="override a report param: key=value; repeatable")

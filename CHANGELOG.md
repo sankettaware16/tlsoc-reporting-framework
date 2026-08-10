@@ -38,6 +38,14 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Scheduled runs now **label the report with the issue date (the day it
+  runs)** while still covering the previous full day: the noon run on the
+  21st writes `daily_web_nginx_2026-07-21.pdf`, and the report shows that
+  date with its Window line stating the covered period in full. This keeps
+  the daily output aligned with a same-day delivery step that looks for
+  today's date. Set `REPORT_DATE=covered` to label by the day the data
+  describes; the framework's own default (outside the wrapper) is unchanged
+  and still labels by the covered day. New `--report-date YYYY-MM-DD` flag.
 - Scheduled runs now cover the **last complete calendar day** by default
   instead of a rolling 24 hours ending at run time, so a daily report always
   describes a whole day regardless of when the job fires. Override with

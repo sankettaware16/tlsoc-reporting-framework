@@ -215,10 +215,14 @@ crontab -e
 0 12 * * * /opt/tlsoc-reporting-framework/scripts/daily_reports.sh
 ```
 
-**Window:** by default each run covers the **last complete calendar day**
-(yesterday 00:00 → today 00:00 in the report timezone), whatever hour it
-runs — so the report always describes a whole day, and is dated for the day
-it describes rather than the day it ran.
+**Window:** by default each scheduled run covers the **last complete calendar
+day** (yesterday 00:00 → today 00:00 in the report timezone), whatever hour it
+runs — so the report always describes a whole day.
+
+**Date label:** the report is labelled with the **issue date — the day it
+runs** (filename and the date shown on it), since that is when it is
+delivered; the Window line still states the full period covered. Set
+`REPORT_DATE=covered` to label by the previous day instead.
 
 **To change the time**, edit the cron line; any hour works because the window
 follows the day, not the run time. Pick a time comfortably after midnight so

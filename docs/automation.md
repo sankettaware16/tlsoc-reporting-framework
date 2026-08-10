@@ -55,8 +55,23 @@ dates, so the same report covers something different at 06:00 than at 12:00,
 and no run ever covers a full day cleanly. With the calendar-day window, a
 run at any hour on the 21st produces one report covering all of the 20th.
 
-**Output is dated for the day it describes, not the day it ran**, so the
-noon run on 21 July writes `daily_web_nginx_2026-07-20.pdf`.
+### How the report is dated
+
+The **window** (what the data covers) and the **label** (the date on the
+filename and the report) are separate:
+
+- The window covers the previous full day (above).
+- The wrapper **labels the report with the issue date — the day it runs** —
+  because that is the day it is delivered, and a same-day delivery step looks
+  for today's date. So the noon run on 21 July writes
+  `daily_web_nginx_2026-07-21.pdf`, and the report shows `21 Jul 2026` while
+  its Window line still states `20 Jul 00:00 → 21 Jul 00:00` in full — nobody
+  is misled about the period analysed.
+
+To label by the day the data describes instead (filename = the previous day),
+set `REPORT_DATE=covered`. An explicit `--report-date YYYY-MM-DD` always wins.
+Running the framework directly (not through the wrapper) labels by the covered
+day by default, so historical re-runs are dated for the day they describe.
 
 ### Changing the schedule
 
@@ -80,6 +95,7 @@ Pick a time comfortably after midnight so the previous day is fully ingested.
 | Rolling 24h ending at run time | `REPORT_WINDOW_END=now` before the command |
 | A specific end instant | `./scripts/daily_reports.sh --window-end 2026-07-10T00:00` |
 | A different span (e.g. weekly) | `./scripts/daily_reports.sh --window-hours 168` |
+| Label files by the covered day, not today | `REPORT_DATE=covered` before the command |
 
 In cron, environment overrides go inline:
 
