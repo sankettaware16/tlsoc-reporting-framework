@@ -26,6 +26,18 @@ fields:
   proxy_instance: "process.name.keyword"
   # original destination host (the real target behind a CONNECT tunnel)
   original_destination: "squid.original_destination.keyword"
+  # Fine-grained result of the transaction as parsed by the engine:
+  # access_denied / connection_failed / malformed_transaction / ...
+  # Drives the gateway-health section (upstream failures vs policy denials).
+  action_detail: "event.action_detail.keyword"
+  # GeoIP/ASN enrichment on the destination side. Optional on other
+  # estates - every section using them degrades gracefully when absent.
+  dest_org: "destination.as.organization.name.keyword"
+  dest_country: "destination.geo.country_name.keyword"
+  # Plain-HTTP requests carry the full URL; CONNECT tunnels do not. Used
+  # for the cloud-metadata (169.254.169.254) probe check.
+  url: "url.original.keyword"
+  dest_domain: "destination.domain.keyword"
   # proxy_host: "host.name"  # the client-facing VIP - not indexed here
 
 # host.name (the client-facing gateway VIP) is NOT indexed on this estate:

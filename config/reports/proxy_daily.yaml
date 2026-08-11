@@ -14,23 +14,42 @@ _defs:
     any:
       - {field: cache_action, wildcard: "*denied*"}
       - {field: status_code, in: [403, 407]}
+  # Upstream connection failures (squid NONE/503 with HIER_NONE): the proxy
+  # accepted the request but could not open the outbound connection. High
+  # volumes usually mean upstream link / DNS trouble, not policy.
+  failed: &failed
+    {field: action_detail, equals: connection_failed}
 
 params:
   window_hours: 24
   top_n: 10
   denied_rate_warn: 2.0
   denied_rate_crit: 10.0
+  # Upstream connection-failure thresholds for the gateway-health badge.
+  fail_rate_warn: 5.0
+  fail_rate_crit: 15.0
   prev_window_min_ratio: 0.5
   # Ports that are NOT plain web browsing - worth an analyst's glance when
-  # they show up through the proxy.
+  # they show up through the proxy. 445 = SMB (worm/scanner traffic),
+  # 6568 = AnyDesk, 5938 = TeamViewer, 853 = DNS-over-TLS (resolver
+  # bypass), 1433/3306 = direct database access.
   unusual_ports: [22, 23, 25, 445, 3389, 5900, 1080, 4444, 6667, 9001,
-                  9050]
+                  9050, 6568, 5938, 853, 1433, 3306]
 
 queries:
   total_requests: {kind: count}
   unique_clients: {kind: cardinality, field: client_ip}
   total_bytes: {kind: sum, field: bytes}
   denied_total: {kind: count, filter: *denied}
+  success_total: {kind: count, optional: true,
+                  filter: {field: outcome, equals: success}}
+  failed_total: {kind: count, filter: *failed, optional: true}
+
+  hourly_failed:
+    kind: date_histogram
+    interval: hour
+    filter: *failed
+    optional: true
 
   hourly:
     kind: date_histogram
@@ -79,6 +98,53 @@ queries:
     size: $top_n
     optional: true
 
+  methods:
+    kind: terms
+    field: method
+    size: 8
+    optional: true
+
+  # Where the traffic actually goes, by ASN organisation and country
+  # (destination-side GeoIP enrichment; estates without it omit these).
+  top_orgs:
+    kind: terms
+    field: dest_org
+    size: $top_n
+    optional: true
+    sub_aggs:
+      bytes: {kind: sum, field: bytes}
+      clients: {kind: cardinality, field: client_ip}
+
+  dest_countries:
+    kind: terms
+    field: dest_country
+    size: $top_n
+    optional: true
+
+  # -- gateway health ----------------------------------------------------
+  # How requests fail, and against which destinations. A destination
+  # collecting failures from MANY clients is an outage; one client failing
+  # against one destination over and over is a retry loop / beacon.
+  error_breakdown:
+    kind: terms
+    field: action_detail
+    size: 10
+    optional: true
+    filter: {field: outcome, equals: failure}
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+      dests: {kind: cardinality, field: dest_ip}
+
+  failing_destinations:
+    kind: terms
+    field: dest_ip
+    size: $top_n
+    optional: true
+    filter: *failed
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+      ports: {kind: top_terms, field: dest_port, size: 3}
+
   unusual_port_traffic:
     kind: terms
     field: dest_port
@@ -103,9 +169,11 @@ queries:
       clients: {kind: cardinality, field: client_ip}
       bytes: {kind: sum, field: bytes}
       denied: {kind: filter, filter: *denied}
+      failed: {kind: filter, filter: *failed}
       dests: {kind: cardinality, field: dest_ip}
     transforms:
       - derive_pct: {num: denied, den: count, to: denied_pct}
+      - derive_pct: {num: failed, den: count, to: failed_pct}
   server_count: {kind: cardinality, field: proxy_instance, optional: true}
 
   cache_actions: {kind: terms, field: cache_action, size: 10,
@@ -122,12 +190,45 @@ queries:
     transforms:
       - classify_ip: {}
 
+  # The destination side of denials: one dest:port collecting hundreds of
+  # denials from a single client is the signature of an automated retry
+  # loop (mis-configured agent - or beaconing malware the ACL is holding).
+  denied_destinations:
+    kind: terms
+    field: dest_ip
+    size: $top_n
+    filter: *denied
+    sub_aggs:
+      ports: {kind: top_terms, field: dest_port, size: 3}
+      clients: {kind: top_terms, field: client_ip, size: 2}
+
+  # Requests for the link-local cloud metadata service (169.254.169.254)
+  # seen at the egress proxy. That address should never be reachable this
+  # way: SSRF-style recon or a badly misconfigured cloud agent.
+  metadata_probes:
+    kind: terms
+    field: client_ip
+    size: 10
+    optional: true
+    filter: {field: url, wildcard: "*169.254.169.254*"}
+    sub_aggs:
+      urls: {kind: top_terms, field: url, size: 2}
+    transforms:
+      - classify_ip: {}
+
   prev_total: {kind: count, window: previous}
 
 computed:
   - {name: total, expr: "q.total_requests or 0"}
   - {name: denied, expr: "q.denied_total or 0"}
   - {name: denied_rate, expr: "pct(c.denied, c.total)"}
+  - {name: failed, expr: "q.failed_total or 0"}
+  - {name: fail_rate, expr: "pct(c.failed, c.total)"}
+  - name: other_errors
+    expr: "max(0, c.total - (q.success_total or 0) - c.denied - c.failed)"
+  - name: smb_traffic
+    expr: "(q.unusual_port_traffic or [])
+           | selectattr('key', 'in', [445, '445']) | list"
   - name: prev_reliable
     expr: "(q.prev_total or 0) >= c.total * params.prev_window_min_ratio
            and (q.prev_total or 0) > 0"
@@ -148,6 +249,19 @@ badges:
       - {when: "c.denied_rate >= params.denied_rate_warn",
          text: WATCH, color: amber}
       - {text: ROUTINE, color: green}
+
+  # Omitted entirely when the datasource does not map `action_detail`
+  # (failed_total stays None, so no level matches).
+  - id: gateway
+    label: "Gateway health"
+    levels:
+      - {when: "q.failed_total is not none
+                and c.fail_rate >= params.fail_rate_crit",
+         text: DEGRADED, color: red}
+      - {when: "q.failed_total is not none
+                and c.fail_rate >= params.fail_rate_warn",
+         text: WATCH, color: amber}
+      - {when: "q.failed_total is not none", text: HEALTHY, color: green}
 
 insights:
   - when: "c.total == 0"
@@ -194,6 +308,33 @@ insights:
       ({{ "%.1f" | format(pct(q.proxy_servers[0].count, c.total)) }}% of
       the total); the per-server breakdown is under Usage.
 
+  - when: "c.failed > 0 and q.failed_total is not none"
+    text: >
+      {{ human_int(c.failed) }} requests
+      ({{ "%.2f" | format(c.fail_rate) }}%) failed to establish an
+      upstream connection.
+      {%- if q.failing_destinations %} The destination failing most was
+      {{ q.failing_destinations[0].key }} with
+      {{ human_int(q.failing_destinations[0].count) }} failed attempts
+      from {{ human_int(q.failing_destinations[0].clients) }}
+      client(s).{% endif %}
+      Sustained failure rates point at upstream link or DNS trouble on the
+      gateway rather than policy — see Gateway health.
+
+  - when: "q.top_orgs"
+    text: >
+      The most-contacted destination network was
+      "{{ q.top_orgs[0].key }}" with
+      {{ human_int(q.top_orgs[0].count) }} requests from
+      {{ human_int(q.top_orgs[0].clients) }} clients
+      ({{ human_bytes(q.top_orgs[0].bytes) }} transferred).
+
+  - when: "q.metadata_probes"
+    text: >
+      {{ human_int(q.metadata_probes | length) }} client(s) requested the
+      cloud metadata address 169.254.169.254 through the proxy —
+      see Policy & Denials for the host list.
+
   - when: "q.unusual_port_traffic"
     text: >
       Traffic to non-web ports was observed:
@@ -208,6 +349,25 @@ insights:
       with {{ human_int(peak.count) }} requests in the hour.
 
 actions:
+  - when: "q.metadata_probes"
+    priority: P2
+    owner: "SOC"
+    text: >
+      Requests for the cloud metadata address 169.254.169.254 reached the
+      egress proxy from
+      {{ q.metadata_probes | map(attribute='key') | join(', ') }}.
+      That link-local address should never be routable here — check the
+      hosts for SSRF exploitation or a misconfigured cloud agent.
+
+  - when: "c.smb_traffic"
+    priority: P2
+    owner: "SOC"
+    text: >
+      Outbound SMB (port 445) was attempted through the proxy
+      ({{ human_int(c.smb_traffic[0].count) }} requests; clients:
+      {{ c.smb_traffic[0].clients }}). SMB to external addresses is
+      classic worm/scanner behaviour — isolate and inspect these hosts.
+
   - when: "q.unusual_port_traffic"
     priority: P2
     owner: "SOC"
@@ -216,6 +376,27 @@ actions:
       ({{ q.unusual_port_traffic | map(attribute='key') | join(', ') }}).
       Confirm each is sanctioned; tunnels to such ports are a common
       exfiltration / C2 pattern.
+
+  - when: "q.denied_destinations and q.denied_destinations[0].count >= 100"
+    priority: P3
+    owner: "SOC"
+    text: >
+      Destination {{ q.denied_destinations[0].key }} (ports
+      {{ q.denied_destinations[0].ports }}) collected
+      {{ human_int(q.denied_destinations[0].count) }} denials, mostly from
+      {{ q.denied_destinations[0].clients }} — an automated retry loop.
+      Identify what is running on the client(s) and why it insists on
+      that destination.
+
+  - when: "q.failed_total is not none
+           and c.fail_rate >= params.fail_rate_warn"
+    priority: P3
+    owner: "Network team"
+    text: >
+      {{ "%.2f" | format(c.fail_rate) }}% of proxied requests failed to
+      connect upstream. Check gateway uplinks and DNS resolution on the
+      proxy nodes; the per-server table shows whether the failures
+      concentrate on specific instances.
 
   - when: "q.denied_clients and q.denied_clients[0].count >= 100"
     priority: P3
@@ -249,6 +430,11 @@ sections:
                  ('warn' if c.denied_rate >= params.denied_rate_warn
                  else 'ok')",
          foot: "{{ '%.2f' | format(c.denied_rate) }}% of requests"}
+      - {label: "Failed connections", value: "c.failed", format: int,
+         style: "'crit' if c.fail_rate >= params.fail_rate_crit else
+                 ('warn' if c.fail_rate >= params.fail_rate_warn
+                 else 'ok')",
+         foot: "{{ '%.2f' | format(c.fail_rate) }}% of requests"}
 
   - {type: heading, title: "Usage"}
   - type: timeseries
@@ -302,6 +488,43 @@ sections:
       color: teal
       show_pct: true
 
+  - type: row
+    left:
+      type: donut
+      title: "Request outcomes"
+      show_if: "c.total > 0 and q.failed_total is not none"
+      center_label: "requests"
+      slices:
+        - {label: "Succeeded", expr: "q.success_total or 0", color: green}
+        - {label: "Policy denied", expr: "c.denied", color: amber}
+        - {label: "Upstream failed", expr: "c.failed", color: red}
+        - {label: "Other errors", expr: "c.other_errors", color: grey}
+    right:
+      type: bars
+      title: "HTTP methods"
+      query: methods
+      skip_if_unmapped: [method]
+      color: navy
+      show_pct: true
+
+  # Destination-side enrichment: which networks and countries the estate
+  # talks to. Rendered only when the datasource maps the GeoIP/ASN fields.
+  - type: row
+    left:
+      type: bars
+      title: "Destination networks (ASN)"
+      query: top_orgs
+      skip_if_unmapped: [dest_org]
+      color: sky
+      show_pct: true
+    right:
+      type: bars
+      title: "Destination countries"
+      query: dest_countries
+      skip_if_unmapped: [dest_country]
+      color: purple
+      show_pct: true
+
   - type: table
     title: "Traffic by proxy server"
     query: proxy_servers
@@ -317,7 +540,47 @@ sections:
       - {key: dests, label: "Destinations", format: int}
       - {key: denied, label: "Denials", format: int}
       - {key: denied_pct, label: "Denied %", format: pct}
+      - {key: failed, label: "Failed", format: int}
+      - {key: failed_pct, label: "Failed %", format: pct}
       - {key: bytes, label: "Bandwidth", format: bytes}
+
+  - {type: heading, title: "Gateway health"}
+  - type: timeseries
+    title: "Upstream connection failures per hour"
+    query: hourly_failed
+    skip_if_unmapped: [action_detail]
+    color: red
+    series_label: "failed connects / hour"
+    note: "Requests the proxy accepted but could not connect upstream
+           (squid NONE/503). A flat non-zero floor is normal background
+           noise; spikes across many destinations mean uplink or DNS
+           trouble on the gateway."
+
+  - type: row
+    left:
+      type: table
+      title: "Failure types"
+      query: error_breakdown
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Failure", format: mono, max: 24}
+        - {key: count, label: "Requests", format: int}
+        - {key: clients, label: "Clients", format: int}
+        - {key: dests, label: "Destinations", format: int}
+    right:
+      type: table
+      title: "Top failing destinations"
+      query: failing_destinations
+      hide_if_empty: true
+      note: "Many clients failing on one destination = that service or the
+             route to it is down. One client failing repeatedly = a retry
+             loop worth a look."
+      columns:
+        - {key: key, label: "Destination", format: mono, width: 110,
+           nowrap: true}
+        - {key: count, label: "Failures", format: int}
+        - {key: clients, label: "Clients", format: int}
+        - {key: ports, label: "Ports", format: mono, max: 18}
 
   - {type: heading, title: "Policy & denials"}
   - type: table
@@ -343,6 +606,37 @@ sections:
       - {key: count, label: "Denials", format: int}
       - {key: dests, label: "Attempted destinations", format: mono,
          max: 40}
+
+  - type: table
+    title: "Most-denied destinations"
+    query: denied_destinations
+    hide_if_empty: true
+    note: "One destination:port collecting hundreds of denials from a
+           single client is the signature of an automated retry loop —
+           a mis-configured agent, or beaconing malware the ACL is
+           currently holding."
+    columns:
+      - {key: key, label: "Destination", format: mono, width: 130,
+         nowrap: true}
+      - {key: count, label: "Denials", format: int}
+      - {key: ports, label: "Ports", format: mono, max: 20}
+      - {key: clients, label: "Top clients", format: mono, max: 40}
+
+  - type: table
+    title: "Cloud metadata probes (169.254.169.254)"
+    query: metadata_probes
+    skip_if_unmapped: [url]
+    hide_if_empty: true
+    note: "The link-local metadata address should never be reachable
+           through an egress proxy — treat as SSRF-style recon or a badly
+           misconfigured cloud agent on the client."
+    columns:
+      - {key: key, label: "Client IP", format: mono, width: 110,
+         nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: count, label: "Requests", format: int}
+      - {key: urls, label: "Requested URLs", format: mono, max: 60}
 
   - type: bars
     title: "Status codes"

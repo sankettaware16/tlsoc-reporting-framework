@@ -9,6 +9,42 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Gateway-health section** for proxy reports. Upstream connection
+  failures (squid `NONE/503`, `event.action_detail: connection_failed`) are
+  now tracked separately from policy denials: a "Failed connections" KPI, a
+  per-hour failure timeseries, a failure-type breakdown, a top-failing-
+  destinations table, per-server Failed / Failed % columns, and a
+  "Gateway health" badge (HEALTHY / WATCH / DEGRADED on configurable
+  `fail_rate_warn` / `fail_rate_crit` thresholds). Sustained failure rates
+  point at uplink/DNS trouble on the gateway — previously they were
+  invisible next to denials.
+- **Request-outcomes donut and HTTP-method chart** for proxy reports:
+  succeeded vs policy-denied vs upstream-failed vs other errors at a
+  glance, alongside a method (CONNECT/GET/POST/…) breakdown.
+- **Destination ASN & country charts** for proxy reports. When the
+  datasource maps the destination-side GeoIP/ASN enrichment
+  (`dest_org`, `dest_country`), the report charts the networks and
+  countries the estate talks to, and the executive summary names the
+  most-contacted destination network. Estates without enrichment omit
+  the charts.
+- **Most-denied destinations table**: the destination side of policy
+  denials, with ports and top clients per row — a single dest:port
+  collecting hundreds of denials from one client is the signature of an
+  automated retry loop (mis-configured agent, or beaconing malware the
+  ACL is holding), and now surfaces as one row plus a P3 action instead
+  of hiding inside per-client totals.
+- **Cloud-metadata probe detection**: plain-HTTP requests for
+  `169.254.169.254` seen at the egress proxy get their own table, an
+  executive-summary line and a P2 action — the link-local metadata
+  address should never be reachable through a forward proxy (SSRF-style
+  recon or a misconfigured cloud agent).
+- **Outbound SMB flagging**: port 445 through the proxy now raises a
+  dedicated P2 action naming the clients (classic worm/scanner
+  behaviour). The unusual-ports watchlist also gains 6568 (AnyDesk),
+  5938 (TeamViewer), 853 (DNS-over-TLS resolver bypass) and 1433/3306
+  (direct database access).
+- Squid datasource: mapped `action_detail`, `dest_org`, `dest_country`,
+  `url` and `dest_domain` logical fields to drive the sections above.
 - **Per-server traffic breakdown** for proxy reports. When a proxy
   datasource maps a `proxy_instance` field — for Squid, the worker/instance
   process name (`squid-2`, `squid-4`, `squid-7`, …) — the report adds a
