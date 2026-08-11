@@ -89,6 +89,25 @@ queries:
       clients: {kind: top_terms, field: client_ip, size: 3}
       dests: {kind: top_terms, field: dest_ip, size: 3}
 
+  # Per-proxy-server breakdown. Grouped by the logical `proxy_instance`
+  # field (e.g. squid's process name: squid-2, squid-4, squid-7 ...), so a
+  # multi-node gateway shows which server carried the load and how each one
+  # behaved. Optional + skip_if_unmapped: datasources that do not map an
+  # instance field simply omit the whole section instead of failing.
+  proxy_servers:
+    kind: terms
+    field: proxy_instance
+    size: 25
+    optional: true
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+      bytes: {kind: sum, field: bytes}
+      denied: {kind: filter, filter: *denied}
+      dests: {kind: cardinality, field: dest_ip}
+    transforms:
+      - derive_pct: {num: denied, den: count, to: denied_pct}
+  server_count: {kind: cardinality, field: proxy_instance, optional: true}
+
   cache_actions: {kind: terms, field: cache_action, size: 10,
                   optional: true}
   status_codes: {kind: terms, field: status_code, size: $top_n}
@@ -166,6 +185,14 @@ insights:
     text: >
       The heaviest downloader was {{ q.bandwidth_clients[0].key }} with
       {{ human_bytes(q.bandwidth_clients[0].bytes) }} transferred.
+
+  - when: "q.proxy_servers and (q.server_count or 0) > 1"
+    text: >
+      Traffic was handled by {{ human_int(q.server_count) }} proxy servers.
+      The busiest was {{ q.proxy_servers[0].key }} with
+      {{ human_int(q.proxy_servers[0].count) }} requests
+      ({{ "%.1f" | format(pct(q.proxy_servers[0].count, c.total)) }}% of
+      the total); the per-server breakdown is under Usage.
 
   - when: "q.unusual_port_traffic"
     text: >
@@ -274,6 +301,23 @@ sections:
       query: cache_actions
       color: teal
       show_pct: true
+
+  - type: table
+    title: "Traffic by proxy server"
+    query: proxy_servers
+    skip_if_unmapped: [proxy_instance]
+    hide_if_empty: true
+    note: "Each row is one proxy instance (its process name). Use it to see
+           which server carried the load, how much it moved, and whether any
+           single node accounts for an unusual share of denials."
+    columns:
+      - {key: key, label: "Server", format: mono, width: 120, nowrap: true}
+      - {key: count, label: "Requests", format: int}
+      - {key: clients, label: "Clients", format: int}
+      - {key: dests, label: "Destinations", format: int}
+      - {key: denied, label: "Denials", format: int}
+      - {key: denied_pct, label: "Denied %", format: pct}
+      - {key: bytes, label: "Bandwidth", format: bytes}
 
   - {type: heading, title: "Policy & denials"}
   - type: table

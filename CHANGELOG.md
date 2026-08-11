@@ -9,6 +9,15 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Per-server traffic breakdown** for proxy reports. When a proxy
+  datasource maps a `proxy_instance` field — for Squid, the worker/instance
+  process name (`squid-2`, `squid-4`, `squid-7`, …) — the report adds a
+  "Traffic by proxy server" table (requests, clients, destinations, denials,
+  denied %, bandwidth per node) and an executive-summary line naming the
+  busiest node and its share of the total. Multi-node gateways can now see
+  which server carried the load and whether any single node accounts for an
+  unusual share of denials. Estates whose datasource does not map an instance
+  field are unaffected — the section stays hidden.
 - **Site-area segmentation** for web reports. A datasource can declare
   `site_areas` (name + URL-path prefix) to split one estate served behind a
   single host into its sections; the report then breaks scanning and exposure
