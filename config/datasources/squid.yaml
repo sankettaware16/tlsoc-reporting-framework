@@ -19,16 +19,20 @@ fields:
   status_code: "http.response.status_code"
   method: "http.request.method.keyword"
   protocol: "network.protocol.keyword"
-  # proxy_host: "host.name"  # not indexed here - see note below
+  # The proxy instance that served the request (squid-2, squid-4, squid-7,
+  # ...): each worker/instance is emitted as its own process name, so this
+  # doubles as the "which server handled it" dimension for the traffic
+  # breakdown. Now indexed on this estate, so the per-server section renders.
+  proxy_instance: "process.name.keyword"
+  # original destination host (the real target behind a CONNECT tunnel)
   original_destination: "squid.original_destination.keyword"
+  # proxy_host: "host.name"  # the client-facing VIP - not indexed here
 
-# The originating host (e.g. the specific mail or proxy server) is NOT
-# indexed on this estate: it appears only inside event.original and is
-# never extracted at parse time. The mapping above is therefore commented
-# out, so any section that groups by it is omitted rather than failing.
-#
-# To enable it, add a grok field for the hostname in the log pipeline,
-# then uncomment the line and re-run:
+# host.name (the client-facing gateway VIP) is NOT indexed on this estate:
+# it appears only inside event.original and is never extracted at parse
+# time. That mapping stays commented out, so any section grouping by it is
+# omitted rather than failing. To enable it, add a grok field for the
+# hostname in the log pipeline, uncomment the line and re-run:
 #     python3 -m framework check-fields --datasource squid
 
 params: {}
