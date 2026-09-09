@@ -1,0 +1,45 @@
+# ===========================================================================
+# Datasource: Campus DNS resolvers - PowerDNS dnsdist (parsed by
+# foss-soc-engine, rules/dns.yaml).
+#
+# One document per logged dnsdist line. `dns_event` separates the two
+# traffic shapes: "query" (Packet from ...) and "answer" (Answer to ...);
+# only answers carry a response code. The daemon's own lines (downstream
+# up/down, security notices, config reloads) arrive as event.action
+# daemon-notice / daemon-message with the body in `message`.
+#
+# Volume note: this is the biggest source on the cluster (~60-85M docs/day),
+# so every report query against it must stay a plain filter + aggregation -
+# never samples over broad filters or terms with large sizes.
+# ===========================================================================
+name: dns
+label: "Campus DNS Resolvers (PowerDNS dnsdist)"
+profile: dns
+index: "fosstlsoc-logs-dns*"
+
+fields:
+  timestamp: "@timestamp"
+  client_ip: "source.ip"
+  client_port: "source.port"
+  query_name: "dns.question.name.keyword"
+  query_type: "dns.question.type.keyword"       # A / HTTPS / AAAA / PTR / TXT ...
+  # Answer result as parsed from dnsdist: "No Error", "Non-Existent domain",
+  # "Query Refused", "Server Failure". Present on answer docs only, so a
+  # filter on it implicitly selects the answer side.
+  response_code: "dns.response_code.keyword"
+  dns_event: "dns.type.keyword"                 # query | answer
+  event_action: "event.action.keyword"          # dns-query / dns-answer / daemon-*
+  resolver: "host.name.keyword"                 # pdns4, ... (the dnsdist node)
+  # Internal location enrichment from the engine's internal-IP map
+  # ("Hostel 04 - Wing 2 Left"). Covers roughly the hostel network today;
+  # unenriched clients degrade to "Unmapped" wherever it is grouped on.
+  location: "source.geo.name.keyword"
+  site_zone: "source.site.zone.keyword"         # hostel | department
+  site_building: "source.site.building.keyword"
+  # rsyslog collapses repeats; the collapsed marker line carries the count.
+  repeat_count: "event.repeat_count"
+  # dnsdist daemon log line body (daemon-notice / daemon-message docs only):
+  # "Marking downstream 10.x.x.x:53 as 'down'", security-update notices, ...
+  daemon_message: "message.keyword"
+
+params: {}

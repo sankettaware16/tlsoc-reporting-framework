@@ -1,0 +1,635 @@
+# ===========================================================================
+# REPORT: Daily DNS Resolver & Security  (profile: dns -> dnsdist et al.)
+# ===========================================================================
+name: dns_daily
+slug: daily_dns           # output filename prefix: <slug>_<datasource>_<date>
+title: "Daily DNS Resolver & Security Report"
+profile: dns
+description: >
+  Executive daily report for campus DNS resolver logs: query volume, client
+  activity, resolution outcomes (NXDOMAIN / SERVFAIL / REFUSED), failing
+  domains, DGA and tunneling indicators, and resolver daemon health.
+
+_defs:
+  # dnsdist logs the received query ("Packet from") and the returned answer
+  # ("Answer to") as separate lines. Rates use ANSWERS as the denominator -
+  # only answers carry a response code.
+  query_side: &query_side {field: dns_event, equals: query}
+  answer_side: &answer_side {field: dns_event, equals: answer}
+  failed_answer: &failed_answer
+    all:
+      - {field: dns_event, equals: answer}
+      - none:
+          - {field: response_code, equals: "No Error"}
+  nxdomain: &nxdomain {field: response_code, equals: "Non-Existent domain"}
+  servfail: &servfail {field: response_code, equals: "Server Failure"}
+  refused: &refused {field: response_code, equals: "Query Refused"}
+  daemon_lines: &daemon_lines
+    {field: event_action, in: [daemon-notice, daemon-message]}
+
+params:
+  window_hours: 24
+  top_n: 10
+  # Share of answers ending NXDOMAIN before the hygiene badge turns. The
+  # campus baseline sits near 3% (typo traffic, stale records, IPv6-probe
+  # fallbacks), so amber starts well above it.
+  nxdomain_rate_warn: 5.0
+  nxdomain_rate_crit: 15.0
+  # SERVFAIL means the resolver itself could not resolve - upstream or
+  # authoritative trouble, not client noise. Baseline ~1%.
+  servfail_rate_warn: 3.0
+  servfail_rate_crit: 10.0
+  refused_rate_warn: 5.0
+  # One client collecting this many NXDOMAIN answers in a day is the DGA /
+  # misconfigured-agent trigger (campus average is ~140 per client).
+  nxdomain_client_min: 1000
+  # Query types that carry payloads in tunneling tools (iodine, dnscat2, ...)
+  # and the per-client daily volume that makes them suspicious. TXT traffic
+  # for the whole campus is ~60k/day, so one host at 2k stands out.
+  tunnel_qtypes: ["TXT", "NULL", "ANY"]
+  tunnel_client_min: 2000
+  # One client above this share of all queries is a runaway process/loop.
+  busy_client_share_warn: 20.0
+  prev_window_min_ratio: 0.5
+
+queries:
+  total_queries: {kind: count, filter: *query_side}
+  total_answers: {kind: count, filter: *answer_side}
+  unique_clients: {kind: cardinality, field: client_ip, filter: *query_side}
+  unique_domains: {kind: cardinality, field: query_name, filter: *query_side}
+
+  nxdomain_total: {kind: count, filter: *nxdomain}
+  servfail_total: {kind: count, filter: *servfail}
+  refused_total: {kind: count, filter: *refused}
+  failed_total: {kind: count, filter: *failed_answer}
+
+  hourly:
+    kind: date_histogram
+    interval: hour
+    filter: *query_side
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+
+  hourly_failed:
+    kind: date_histogram
+    interval: hour
+    filter: *failed_answer
+
+  rcodes:
+    kind: terms
+    field: response_code
+    size: 10
+    filter: *answer_side
+
+  qtypes:
+    kind: terms
+    field: query_type
+    size: 12
+    filter: *query_side
+
+  top_clients:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    filter: *query_side
+    sub_aggs:
+      domains: {kind: cardinality, field: query_name}
+      qtype: {kind: top_terms, field: query_type, size: 2}
+      site: {kind: top_terms, field: location, size: 1, missing: "Unmapped"}
+    transforms:
+      - classify_ip: {}
+
+  top_domains:
+    kind: terms
+    field: query_name
+    size: $top_n
+    filter: *query_side
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+
+  nxdomain_domains:
+    kind: terms
+    field: query_name
+    size: $top_n
+    filter: *nxdomain
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+
+  servfail_domains:
+    kind: terms
+    field: query_name
+    size: $top_n
+    filter: *servfail
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+
+  # The client side of NXDOMAIN storms: one host churning through MANY
+  # distinct non-existent names is the DGA-malware signature; churning
+  # through ONE name is a stale config or a typo'd search domain.
+  nxdomain_clients:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    filter: *nxdomain
+    sub_aggs:
+      domains: {kind: cardinality, field: query_name}
+      examples: {kind: top_terms, field: query_name, size: 2}
+      site: {kind: top_terms, field: location, size: 1, missing: "Unmapped"}
+    transforms:
+      - classify_ip: {}
+
+  refused_clients:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    filter: *refused
+    sub_aggs:
+      examples: {kind: top_terms, field: query_name, size: 2}
+      site: {kind: top_terms, field: location, size: 1, missing: "Unmapped"}
+    transforms:
+      - classify_ip: {}
+
+  # Heavy TXT/NULL/ANY volume from a single client - the payload-carrying
+  # query types tunneling tools ride on. min_count keeps ordinary hosts
+  # (a handful of SPF/DKIM lookups) out of the table entirely.
+  tunnel_suspects:
+    kind: terms
+    field: client_ip
+    size: 10
+    filter:
+      all:
+        - {field: dns_event, equals: query}
+        - {field: query_type, in_param: tunnel_qtypes}
+    sub_aggs:
+      domains: {kind: cardinality, field: query_name}
+      qtype: {kind: top_terms, field: query_type, size: 3}
+    transforms:
+      - classify_ip: {}
+      - min_count: {value: $tunnel_client_min}
+
+  # Per-resolver-node breakdown (host.name: pdns4, ...). One node today;
+  # the section is ready for the fleet and collapses to one row meanwhile.
+  resolvers:
+    kind: terms
+    field: resolver
+    size: 10
+    optional: true
+    sub_aggs:
+      queries: {kind: filter, filter: *query_side}
+      answers: {kind: filter, filter: *answer_side}
+      failed: {kind: filter, filter: *failed_answer}
+      clients: {kind: cardinality, field: client_ip}
+    transforms:
+      - derive_pct: {num: failed, den: answers, to: failed_pct}
+  resolver_count: {kind: cardinality, field: resolver, optional: true}
+
+  # dnsdist's own operational lines: downstream up/down transitions,
+  # security-status notices, config reloads. Tiny volume, high signal.
+  daemon_notices:
+    kind: terms
+    field: daemon_message
+    size: 10
+    optional: true
+    filter: *daemon_lines
+    sub_aggs:
+      resolvers: {kind: top_terms, field: resolver, size: 3}
+
+  downstream_down_total:
+    kind: count
+    optional: true
+    filter:
+      all:
+        - {field: event_action, in: [daemon-notice, daemon-message]}
+        - {field: daemon_message, wildcard: "*as 'down'*"}
+
+  # Campus segmentation from the engine's internal-IP map. Unenriched
+  # clients (roughly the non-hostel networks today) group under "Unmapped".
+  zones:
+    kind: terms
+    field: site_zone
+    size: 10
+    optional: true
+    filter: *query_side
+    missing: "Unmapped"
+
+  top_buildings:
+    kind: terms
+    field: site_building
+    size: $top_n
+    optional: true
+    filter: *query_side
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+
+  mapped_total:
+    kind: count
+    optional: true
+    filter:
+      all:
+        - {field: dns_event, equals: query}
+        - {field: site_building, exists: true}
+
+  prev_total: {kind: count, window: previous, filter: *query_side}
+
+computed:
+  - {name: total, expr: "q.total_queries or 0"}
+  - {name: answers, expr: "q.total_answers or 0"}
+  - {name: nxdomain, expr: "q.nxdomain_total or 0"}
+  - {name: servfail, expr: "q.servfail_total or 0"}
+  - {name: refused, expr: "q.refused_total or 0"}
+  - {name: failed, expr: "q.failed_total or 0"}
+  - {name: noerror, expr: "max(0, c.answers - c.failed)"}
+  - {name: nxdomain_rate, expr: "pct(c.nxdomain, c.answers)"}
+  - {name: servfail_rate, expr: "pct(c.servfail, c.answers)"}
+  - {name: refused_rate, expr: "pct(c.refused, c.answers)"}
+  - {name: success_rate, expr: "pct(c.noerror, c.answers)"}
+  - name: top_client_share
+    expr: "pct(q.top_clients[0].count, c.total) if q.top_clients else 0"
+  - name: external_top_clients
+    expr: "(q.top_clients or [])
+           | selectattr('scope', 'equalto', 'EXTERNAL') | list"
+  - name: prev_reliable
+    expr: "(q.prev_total or 0) >= c.total * params.prev_window_min_ratio
+           and (q.prev_total or 0) > 0"
+  - name: delta_queries
+    expr: "delta_pct(c.total, q.prev_total) if c.prev_reliable else None"
+  - name: data_warning
+    expr: "None if c.prev_reliable or c.total == 0 else
+           'Previous window logged only ' ~ human_int(q.prev_total) ~
+           ' queries against ' ~ human_int(c.total) ~ ' now â€” trend
+           comparison suppressed (likely ingest gap).'"
+
+badges:
+  - id: resolution
+    label: "Resolution health"
+    levels:
+      - {when: "c.servfail_rate >= params.servfail_rate_crit",
+         text: DEGRADED, color: red}
+      - {when: "c.servfail_rate >= params.servfail_rate_warn",
+         text: WATCH, color: amber}
+      - {text: HEALTHY, color: green}
+
+  - id: hygiene
+    label: "Lookup hygiene"
+    levels:
+      - {when: "c.nxdomain_rate >= params.nxdomain_rate_crit",
+         text: ELEVATED, color: red}
+      - {when: "c.nxdomain_rate >= params.nxdomain_rate_warn",
+         text: WATCH, color: amber}
+      - {text: ROUTINE, color: green}
+
+insights:
+  - when: "c.total == 0"
+    stop: true
+    text: >
+      No DNS traffic was recorded in the reporting window. Verify the log
+      pipeline and that {{ ds.index }} is receiving documents.
+
+  - text: >
+      {{ human_int(c.total) }} DNS queries from
+      {{ human_int(q.unique_clients) }} client hosts for
+      {{ human_int(q.unique_domains) }} distinct names;
+      {{ human_int(c.answers) }} answers were logged
+      {%- if c.delta_queries is not none %}
+      ({{ "â–²" if c.delta_queries > 0 else "â–¼" }}
+      {{ "%.1f" | format(c.delta_queries | abs) }}% vs previous
+      {{ window.hours }}h){% endif %}.
+
+  - when: "c.answers > 0"
+    text: >
+      {{ "%.1f" | format(c.success_rate) }}% of answers resolved without
+      error; {{ human_int(c.nxdomain) }}
+      ({{ "%.2f" | format(c.nxdomain_rate) }}%) hit non-existent domains,
+      {{ human_int(c.refused) }} ({{ "%.2f" | format(c.refused_rate) }}%)
+      were refused by policy and {{ human_int(c.servfail) }}
+      ({{ "%.2f" | format(c.servfail_rate) }}%) failed on the server side.
+
+  - when: "q.top_clients"
+    text: >
+      The most active client was {{ q.top_clients[0].key }}
+      ({{ q.top_clients[0].site }}) with
+      {{ human_int(q.top_clients[0].count) }} queries
+      ({{ "%.1f" | format(c.top_client_share) }}% of all traffic) for
+      {{ human_int(q.top_clients[0].domains) }} distinct names.
+
+  - when: "c.external_top_clients"
+    text: >
+      Non-campus (EXTERNAL) source addresses appear among the top DNS
+      clients â€” a campus resolver should serve internal clients only.
+      See the recommended actions.
+
+  - when: "q.nxdomain_clients and
+           q.nxdomain_clients[0].count >= params.nxdomain_client_min"
+    text: >
+      Client {{ q.nxdomain_clients[0].key }} alone collected
+      {{ human_int(q.nxdomain_clients[0].count) }} NXDOMAIN answers across
+      {{ human_int(q.nxdomain_clients[0].domains) }} distinct names â€”
+      see Security signals.
+
+  - when: "c.servfail > 0 and q.servfail_domains"
+    text: >
+      The name failing most with Server Failure was
+      {{ q.servfail_domains[0].key }}
+      ({{ human_int(q.servfail_domains[0].count) }} failures affecting
+      {{ human_int(q.servfail_domains[0].clients) }} clients).
+
+  - when: "q.tunnel_suspects"
+    text: >
+      {{ q.tunnel_suspects | length }} client(s) generated unusually heavy
+      {{ params.tunnel_qtypes | join('/') }} query volume â€” the
+      payload-carrying types tunneling tools use. See Security signals.
+
+  - when: "(q.downstream_down_total or 0) > 0"
+    text: >
+      dnsdist marked a downstream resolver as 'down'
+      {{ human_int(q.downstream_down_total) }} time(s) in the window â€”
+      the exact messages are under Resolver daemon notices.
+
+  - when: "q.resolvers and (q.resolver_count or 0) > 1"
+    text: >
+      Traffic was answered by {{ human_int(q.resolver_count) }} resolver
+      nodes; the busiest was {{ q.resolvers[0].key }} with
+      {{ human_int(q.resolvers[0].queries) }} queries â€” the per-node
+      breakdown is under Resolution health.
+
+  - when: "q.top_buildings"
+    text: >
+      The busiest mapped campus location was {{ q.top_buildings[0].key }}
+      ({{ human_int(q.top_buildings[0].count) }} queries from
+      {{ human_int(q.top_buildings[0].clients) }} clients); location
+      mapping covers {{ "%.0f" | format(pct(q.mapped_total or 0, c.total)) }}%
+      of query traffic.
+
+  - when: "q.hourly"
+    text: >
+      {% set peak = q.hourly | max(attribute='count') %}
+      Query volume peaked around {{ peak.label }} {{ window.tz_label }}
+      with {{ human_int(peak.count) }} queries in the hour from
+      {{ human_int(peak.clients) }} clients.
+
+actions:
+  - when: "c.external_top_clients"
+    priority: P2
+    owner: "SOC + Network team"
+    text: >
+      External source addresses are querying the campus resolver:
+      {{ c.external_top_clients | map(attribute='key') | join(', ') }}.
+      A campus resolver must not answer the open internet â€” verify edge
+      ACLs and dnsdist client rules before this is abused for
+      reflection/amplification.
+
+  - when: "q.nxdomain_clients and
+           q.nxdomain_clients[0].count >= params.nxdomain_client_min"
+    priority: P2
+    owner: "SOC"
+    text: >
+      Client {{ q.nxdomain_clients[0].key }}
+      ({{ q.nxdomain_clients[0].site }}) collected
+      {{ human_int(q.nxdomain_clients[0].count) }} NXDOMAIN answers across
+      {{ human_int(q.nxdomain_clients[0].domains) }} distinct names
+      (e.g. {{ q.nxdomain_clients[0].examples }}). A sustained NXDOMAIN
+      storm from one host is the classic DGA-malware signature â€”
+      identify the process behind the lookups.
+
+  - when: "q.tunnel_suspects"
+    priority: P2
+    owner: "SOC"
+    text: >
+      {{ q.tunnel_suspects | map(attribute='key') | join(', ') }}
+      exceeded {{ human_int(params.tunnel_client_min) }}
+      {{ params.tunnel_qtypes | join('/') }} queries in
+      {{ window.hours }}h â€” the classic DNS-tunneling / exfiltration
+      profile. Inspect the querying process and the names in the
+      Security signals table.
+
+  - when: "c.servfail_rate >= params.servfail_rate_warn"
+    priority: P3
+    owner: "Network team"
+    text: >
+      {{ "%.2f" | format(c.servfail_rate) }}% of answers were Server
+      Failure. Check the upstream forwarders and the authoritative zones
+      behind the most-failing names:
+      {{ (q.servfail_domains or [])[:3] | map(attribute='key')
+         | join(', ') }}.
+
+  - when: "(q.downstream_down_total or 0) > 0"
+    priority: P3
+    owner: "Network team"
+    text: >
+      dnsdist marked a downstream resolver as 'down'
+      {{ human_int(q.downstream_down_total) }} time(s). Check the health
+      of the backend resolvers behind dnsdist â€” the exact transitions are
+      listed under Resolver daemon notices.
+
+  - when: "c.top_client_share >= params.busy_client_share_warn"
+    priority: P3
+    owner: "SOC"
+    text: >
+      A single client ({{ q.top_clients[0].key }},
+      {{ q.top_clients[0].site }}) generated
+      {{ "%.1f" | format(c.top_client_share) }}% of all DNS queries.
+      If this is not a known batch host or monitoring probe, check for a
+      runaway process or a resolution loop.
+
+  - when: "c.refused_rate >= params.refused_rate_warn"
+    priority: P3
+    owner: "Network team"
+    text: >
+      {{ "%.2f" | format(c.refused_rate) }}% of answers were Query
+      Refused. If this is new, check dnsdist ACLs and rate-limiting
+      rules â€” either policy is over-matching legitimate clients or
+      unauthorised networks are reaching the resolver.
+
+sections:
+  - {type: heading, title: "Executive summary"}
+  - {type: insights}
+
+  - type: kpi_row
+    items:
+      - {label: "DNS queries", value: "c.total", format: int,
+         delta: "c.delta_queries"}
+      - {label: "Client hosts", value: "q.unique_clients", format: int}
+      - {label: "Distinct names", value: "q.unique_domains", format: int}
+      - {label: "NXDOMAIN answers", value: "c.nxdomain", format: int,
+         style: "'crit' if c.nxdomain_rate >= params.nxdomain_rate_crit
+                 else ('warn' if c.nxdomain_rate >= params.nxdomain_rate_warn
+                 else 'ok')",
+         foot: "{{ '%.2f' | format(c.nxdomain_rate) }}% of answers"}
+      - {label: "Server failures", value: "c.servfail", format: int,
+         style: "'crit' if c.servfail_rate >= params.servfail_rate_crit
+                 else ('warn' if c.servfail_rate >= params.servfail_rate_warn
+                 else 'ok')",
+         foot: "{{ '%.2f' | format(c.servfail_rate) }}% of answers"}
+
+  - {type: heading, title: "Query activity"}
+  - type: timeseries
+    title: "Queries per hour"
+    query: hourly
+    overlay: hourly_failed
+    series_label: "queries / hour"
+    overlay_label: "failed answers"
+
+  - type: row
+    left:
+      type: bars
+      title: "Query types"
+      query: qtypes
+      color: navy
+      show_pct: true
+    right:
+      type: bars
+      title: "Answer outcomes"
+      query: rcodes
+      color: teal
+      show_pct: true
+
+  - type: table
+    title: "Top clients"
+    query: top_clients
+    columns:
+      - {key: key, label: "Client IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: site, label: "Campus location", max: 26}
+      - {key: count, label: "Queries", format: int}
+      - {key: domains, label: "Distinct names", format: int}
+      - {key: qtype, label: "Top types", format: mono, max: 14}
+
+  - type: row
+    left:
+      type: table
+      title: "Most-queried names"
+      query: top_domains
+      columns:
+        - {key: key, label: "Name", max: 40}
+        - {key: count, label: "Queries", format: int}
+        - {key: clients, label: "Clients", format: int}
+    right:
+      type: bars
+      title: "Traffic by campus zone"
+      query: zones
+      skip_if_unmapped: [site_zone]
+      color: sky
+      show_pct: true
+
+  - type: bars
+    title: "Busiest campus buildings"
+    query: top_buildings
+    skip_if_unmapped: [site_building]
+    show_if: "q.top_buildings"
+    color: purple
+
+  - {type: heading, title: "Resolution health"}
+  - type: timeseries
+    title: "Failed answers per hour (NXDOMAIN + REFUSED + SERVFAIL)"
+    query: hourly_failed
+    color: red
+    series_label: "failed answers / hour"
+    note: "A flat floor is normal background noise (typos, stale records,
+           IPv6 fallbacks). A spike concentrated in one hour usually means
+           an upstream outage or one misbehaving host â€” cross-check the
+           tables below."
+
+  - type: row
+    left:
+      type: table
+      title: "Top NXDOMAIN names"
+      query: nxdomain_domains
+      hide_if_empty: true
+      note: "Many clients failing on ONE name = a stale/retired record
+             still configured somewhere. One client failing on MANY names
+             belongs in Security signals."
+      columns:
+        - {key: key, label: "Name", max: 34}
+        - {key: count, label: "Misses", format: int}
+        - {key: clients, label: "Clients", format: int}
+    right:
+      type: table
+      title: "Top SERVFAIL names"
+      query: servfail_domains
+      hide_if_empty: true
+      note: "Server Failure is the resolver's own inability to resolve â€”
+             broken delegations, DNSSEC failures or unreachable
+             authoritative servers."
+      columns:
+        - {key: key, label: "Name", max: 34}
+        - {key: count, label: "Failures", format: int}
+        - {key: clients, label: "Clients", format: int}
+
+  - type: table
+    title: "Clients with refused queries"
+    query: refused_clients
+    hide_if_empty: true
+    note: "Refusals are dnsdist policy (ACLs, rate limits). A campus host
+           collecting refusals is misconfigured; an EXTERNAL one is probing
+           an open-resolver surface."
+    columns:
+      - {key: key, label: "Client IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: site, label: "Campus location", max: 24}
+      - {key: count, label: "Refusals", format: int}
+      - {key: examples, label: "Example names", format: mono, max: 36}
+
+  - type: table
+    title: "Traffic by resolver node"
+    query: resolvers
+    skip_if_unmapped: [resolver]
+    hide_if_empty: true
+    note: "Each row is one dnsdist node. Use it to see which node carried
+           the load and whether failures concentrate on a single node."
+    columns:
+      - {key: key, label: "Resolver", format: mono, width: 110, nowrap: true}
+      - {key: queries, label: "Queries", format: int}
+      - {key: answers, label: "Answers", format: int}
+      - {key: failed, label: "Failed answers", format: int}
+      - {key: failed_pct, label: "Failed %", format: pct}
+      - {key: clients, label: "Clients", format: int}
+
+  - type: table
+    title: "Resolver daemon notices"
+    query: daemon_notices
+    skip_if_unmapped: [daemon_message]
+    hide_if_empty: true
+    note: "dnsdist's own operational lines: downstream resolvers marked
+           up/down, security-status changes, config reloads. Tiny volume,
+           high signal â€” 'down' transitions feed a recommended action."
+    columns:
+      - {key: key, label: "Daemon message", format: mono, max: 64}
+      - {key: count, label: "Times", format: int}
+      - {key: resolvers, label: "Node(s)", format: mono, max: 16}
+
+  - {type: heading, title: "Security signals"}
+  - type: table
+    title: "Clients with most NXDOMAIN answers"
+    query: nxdomain_clients
+    hide_if_empty: true
+    note: "One host churning through MANY distinct non-existent names is
+           the DGA-malware signature; churning through ONE name is a stale
+           config. The 'Distinct names' column separates the two."
+    columns:
+      - {key: key, label: "Client IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: site, label: "Campus location", max: 22}
+      - {key: count, label: "NXDOMAIN", format: int}
+      - {key: domains, label: "Distinct names", format: int}
+      - {key: examples, label: "Example names", format: mono, max: 34}
+
+  - type: table
+    title: "Possible DNS tunneling (heavy TXT/NULL/ANY volume)"
+    query: tunnel_suspects
+    hide_if_empty: true
+    note: "Tunneling tools (iodine, dnscat2, ...) move data in
+           payload-carrying query types. Ordinary hosts make a handful of
+           TXT lookups a day; thousands from one client deserve a look."
+    columns:
+      - {key: key, label: "Client IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: count, label: "Queries", format: int}
+      - {key: domains, label: "Distinct names", format: int}
+      - {key: qtype, label: "Types", format: mono, max: 16}
+
+  - {type: heading, title: "Recommended actions"}
+  - {type: actions}

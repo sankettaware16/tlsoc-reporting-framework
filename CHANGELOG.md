@@ -9,6 +9,24 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **DNS log source + daily DNS report** (`dns_daily` × `dns`). New `dns`
+  datasource for the campus PowerDNS dnsdist resolvers
+  (`fosstlsoc-logs-dns*`, parsed by foss-soc-engine `rules/dns.yaml`,
+  ~60–85M docs/day) and a new `dns` report profile. The daily report
+  covers query/answer volume and trend, per-hour activity with a
+  failed-answer overlay, query types, answer outcomes (NXDOMAIN /
+  REFUSED / SERVFAIL rates driving "Resolution health" and "Lookup
+  hygiene" badges), top clients with campus-location enrichment
+  (`source.geo.name` / `source.site.*`), most-queried names, campus
+  zone and building breakdowns, top NXDOMAIN and SERVFAIL names,
+  refused clients, a per-resolver-node table and dnsdist daemon
+  notices (downstream `down` transitions raise a P3). Two
+  security-signal tables raise P2 actions: NXDOMAIN-storm clients
+  (the DGA-malware signature, separated from stale-config noise by a
+  distinct-names column) and heavy TXT/NULL/ANY clients (the
+  DNS-tunneling profile). EXTERNAL addresses among the top talkers
+  flag open-resolver exposure with a P2.
+
 - **Gateway-health section** for proxy reports. Upstream connection
   failures (squid `NONE/503`, `event.action_detail: connection_failed`) are
   now tracked separately from policy denials: a "Failed connections" KPI, a
