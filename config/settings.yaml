@@ -16,7 +16,11 @@ elasticsearch:
   user: "elastic"
   password: ""          # empty = auto-detect; prefer TLSOC_ES_PASS env var
   ca_cert: null         # null = auto-detect from <deploy dir>/certs/ca/ca.crt
-  request_timeout: 120
+  # 300s: the first cold signature query over the multi-vhost nginx day
+  # (~5M docs) exceeds 120s and degraded the Attack-signature table on
+  # every run since the estate grew; later signature queries ride the
+  # warmed cache and stay fast.
+  request_timeout: 300
 
 # Where the co-located TLSOC docker stack lives (used for auto-detection).
 tlsoc_deploy:

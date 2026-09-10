@@ -25,9 +25,25 @@ description: >
 
 # ---------------------------------------------------------------------------
 _defs:
+  # An access-log line: it carries an HTTP status. On estates whose index
+  # mixes access lines with error/WAF documents (nginx since the
+  # multi-vhost + NAXSI rollout), this keeps every traffic metric honest;
+  # on pure access-log estates (moodle) it matches every document.
+  access_line: &access_line {field: status_code, exists: true}
+
+  # Edge-event selectors (only error/denied documents carry event_action;
+  # estates that do not map it skip every dependent section).
+  waf_hit: &waf_hit {field: event_action, equals: waf_block}
+  rate_limited: &rate_limited {field: event_action, equals: rate_limit}
+  upstream_fail: &upstream_fail {field: event_action, prefix: upstream}
+
   # Anything matching the signature pack, minus this estate's own assets.
+  # Access lines only: requests the WAF denied never reached the access
+  # log and are reported in the WAF section instead, not double-counted
+  # as probes.
   threat_scope: &threat_scope
     all:
+      - *access_line
       - signatures: web_threats
       - none:
           - {field: url_path, prefix_param: benign_path_prefixes}
@@ -36,6 +52,7 @@ _defs:
   # Critical/high only - used for the raw evidence samples.
   serious_scope: &serious_scope
     all:
+      - *access_line
       - signatures: web_threats
         severities: [critical, high]
       - none:
@@ -68,6 +85,13 @@ params:
   probe_success_codes: [200, 201, 202, 203, 206]
   write_methods: [PUT, DELETE, PATCH, TRACE, CONNECT, PROPFIND, MOVE, COPY,
                   SEARCH, MKCOL]
+
+  # WAF / edge-health thresholds. Only meaningful on estates whose
+  # datasource maps the WAF and edge-error fields (nginx); ignored
+  # everywhere else.
+  waf_ip_action_min: 200           # NAXSI blocks from ONE ip -> P2 action
+  upstream_fail_warn: 1000         # upstream failures in window -> P2 action
+  rl_ip_review_min: 1000           # rate-limit hits from one ip -> P3 action
 
   # Estate-specific first-party prefixes come from the datasource
   # (extra_benign_path_prefixes) and are appended to this list.
@@ -149,9 +173,10 @@ params:
 
 # ---------------------------------------------------------------------------
 queries:
-  total_requests: {kind: count}
-  unique_visitors: {kind: cardinality, field: client_ip}
-  total_bytes: {kind: sum, field: response_bytes}
+  total_requests: {kind: count, filter: *access_line}
+  unique_visitors: {kind: cardinality, field: client_ip,
+                    filter: *access_line}
+  total_bytes: {kind: sum, field: response_bytes, filter: *access_line}
 
   status_classes:
     kind: range_buckets
@@ -167,6 +192,7 @@ queries:
   hourly:
     kind: date_histogram
     interval: hour
+    filter: *access_line
     sub_aggs:
       visitors: {kind: cardinality, field: client_ip}
       errors: {kind: filter, filter: *real_errors}
@@ -176,7 +202,8 @@ queries:
     interval: hour
     filter: *threat_scope
 
-  top_urls: {kind: terms, field: url_path, size: $top_n}
+  top_urls: {kind: terms, field: url_path, size: $top_n,
+             filter: *access_line}
 
   top_4xx_paths:
     kind: terms
@@ -244,13 +271,17 @@ queries:
     sub_aggs:
       referrer: {kind: top_terms, field: referrer, size: 1, missing: "-"}
 
-  methods: {kind: terms, field: method, size: $top_n, optional: true}
+  methods: {kind: terms, field: method, size: $top_n, optional: true,
+            filter: *access_line}
 
   write_methods:
     kind: terms
     field: method
     size: 10
-    filter: {field: method, in_param: write_methods}
+    filter:
+      all:
+        - *access_line
+        - {field: method, in_param: write_methods}
     optional: true
     sub_aggs:
       ips: {kind: top_terms, field: client_ip, size: 3}
@@ -263,6 +294,7 @@ queries:
     size: $top_n
     missing: "(direct / none)"
     optional: true
+    filter: *access_line
 
   # Geography of EXTERNAL traffic only. Internal addressing has no public
   # geolocation, so leaving it in produces a large "Unresolved" bucket that
@@ -275,22 +307,27 @@ queries:
     missing: "Unresolved"
     optional: true
     filter:
-      none:
-        - {field: client_ip, ip_in_param: private_cidrs}
-        - {field: client_ip, ip_in_param: internal_cidrs}
+      all:
+        - *access_line
+        - none:
+            - {field: client_ip, ip_in_param: private_cidrs}
+            - {field: client_ip, ip_in_param: internal_cidrs}
 
   internal_requests:
     kind: count
     optional: true
     filter:
-      any:
-        - {field: client_ip, ip_in_param: private_cidrs}
-        - {field: client_ip, ip_in_param: internal_cidrs}
+      all:
+        - *access_line
+        - any:
+            - {field: client_ip, ip_in_param: private_cidrs}
+            - {field: client_ip, ip_in_param: internal_cidrs}
 
   top_ips:
     kind: terms
     field: client_ip
     size: $top_n
+    filter: *access_line
     sub_aggs:
       country: {kind: top_terms, field: geo_country, size: 1}
       city: {kind: top_terms, field: geo_city, size: 1}
@@ -316,8 +353,10 @@ queries:
       unique_paths: {kind: cardinality, field: url_path}
       errors: {kind: filter, filter: *real_errors}
     filter:
-      none:
-        - {field: client_ip, ip_in_param: infrastructure_cidrs}
+      all:
+        - *access_line
+        - none:
+            - {field: client_ip, ip_in_param: infrastructure_cidrs}
     transforms:
       - classify_ip: {}
       - derive_pct: {num: errors, den: count, to: err_pct}
@@ -328,6 +367,7 @@ queries:
     field: url_path
     size: $top_n
     order_by: bytes
+    filter: *access_line
     sub_aggs:
       bytes: {kind: sum, field: response_bytes}
 
@@ -336,6 +376,7 @@ queries:
     field: client_ip
     size: $top_n
     order_by: bytes
+    filter: *access_line
     sub_aggs:
       bytes: {kind: sum, field: response_bytes}
       country: {kind: top_terms, field: geo_country, size: 1}
@@ -404,6 +445,7 @@ queries:
     field: url_path
     groups_param: site_areas
     other_name: $main_site_name
+    filter: *access_line
     sub_aggs:
       visitors: {kind: cardinality, field: client_ip}
       errors: {kind: filter, filter: *real_errors}
@@ -434,12 +476,16 @@ queries:
   auth_total:
     kind: count
     optional: true
-    filter: {field: url_path, wildcard_param: auth_path_patterns}
+    filter:
+      all:
+        - *access_line
+        - {field: url_path, wildcard_param: auth_path_patterns}
   auth_posts:
     kind: count
     optional: true
     filter:
       all:
+        - *access_line
         - {field: url_path, wildcard_param: auth_path_patterns}
         - {field: method, equals: "POST"}
   auth_denied:
@@ -454,7 +500,10 @@ queries:
     field: client_ip
     size: 5
     optional: true
-    filter: {field: url_path, wildcard_param: auth_path_patterns}
+    filter:
+      all:
+        - *access_line
+        - {field: url_path, wildcard_param: auth_path_patterns}
     sub_aggs:
       country: {kind: top_terms, field: geo_country, size: 1}
       posts: {kind: filter, filter: {field: method, equals: "POST"}}
@@ -492,10 +541,166 @@ queries:
     transforms:
       - derive_pct: {num: errors, den: count, to: err_pct}
 
+  # -- per-domain / vhost breakdown (multi-domain estates: nginx) ----------
+  # `domain` is the vhost the request addressed (url.domain). Estates that
+  # do not map it (moodle - single-site) skip everything below.
+  domain_count: {kind: cardinality, field: domain, optional: true,
+                 filter: *access_line}
+
+  domains:
+    kind: terms
+    field: domain
+    size: 15
+    optional: true
+    filter: *access_line
+    sub_aggs:
+      visitors: {kind: cardinality, field: client_ip}
+      bytes: {kind: sum, field: response_bytes}
+      errors: {kind: filter, filter: *real_errors}
+      err5xx: {kind: filter,
+               filter: {field: status_code, range: {gte: 500, lt: 600}}}
+    transforms:
+      - derive_pct: {num: errors, den: count, to: err_pct}
+
+  probe_domains:
+    kind: terms
+    field: domain
+    size: $top_n
+    optional: true
+    filter: *threat_scope
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+      served: {kind: filter,
+               filter: {field: status_code, in_param: probe_success_codes}}
+      top_path: {kind: top_terms, field: url_path, size: 1}
+
+  edge_servers:
+    kind: terms
+    field: edge_server
+    size: 10
+    optional: true
+    filter: *access_line
+    sub_aggs:
+      visitors: {kind: cardinality, field: client_ip}
+      bytes: {kind: sum, field: response_bytes}
+      errors: {kind: filter, filter: *real_errors}
+    transforms:
+      - derive_pct: {num: errors, den: count, to: err_pct}
+
+  # -- WAF (NAXSI) - requests denied at the edge ---------------------------
+  # These are `denied` documents, not access lines: a blocked request
+  # never reaches the access log, so nothing here overlaps the
+  # signature-probe numbers above.
+  waf_total: {kind: count, optional: true, filter: *waf_hit}
+  waf_sources_count: {kind: cardinality, field: client_ip, optional: true,
+                      filter: *waf_hit}
+
+  hourly_waf:
+    kind: date_histogram
+    interval: hour
+    optional: true
+    filter: *waf_hit
+
+  waf_categories:
+    kind: terms
+    field: waf_rule_category
+    size: 8
+    optional: true
+    filter: *waf_hit
+
+  waf_zones:
+    kind: terms
+    field: waf_zone
+    size: 8
+    optional: true
+    filter: *waf_hit
+
+  waf_rules:
+    kind: terms
+    field: waf_rule_id
+    size: $top_n
+    optional: true
+    filter: *waf_hit
+    sub_aggs:
+      category: {kind: top_terms, field: waf_rule_category, size: 1}
+      ips: {kind: cardinality, field: client_ip}
+      zones: {kind: top_terms, field: waf_zone, size: 2}
+      top_domain: {kind: top_terms, field: domain, size: 1}
+
+  waf_ips:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    optional: true
+    filter: *waf_hit
+    sub_aggs:
+      cats: {kind: top_terms, field: waf_rule_category, size: 2}
+      domains: {kind: cardinality, field: domain}
+      top_domain: {kind: top_terms, field: domain, size: 1}
+    transforms:
+      - classify_ip: {}
+
+  waf_domains:
+    kind: terms
+    field: domain
+    size: $top_n
+    optional: true
+    filter: *waf_hit
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+      top_rule: {kind: top_terms, field: waf_rule_id, size: 1}
+      top_cat: {kind: top_terms, field: waf_rule_category, size: 1}
+
+  # -- edge health: limiter pressure and upstream (backend) failures -------
+  edge_error_breakdown:
+    kind: terms
+    field: event_action
+    size: 12
+    optional: true
+    sub_aggs:
+      ips: {kind: cardinality, field: client_ip}
+      domains: {kind: cardinality, field: domain}
+
+  rate_limited_total: {kind: count, optional: true, filter: *rate_limited}
+
+  rate_limited_ips:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    optional: true
+    filter: *rate_limited
+    sub_aggs:
+      zones: {kind: top_terms, field: rate_limit_zone, size: 2}
+      domains: {kind: top_terms, field: domain, size: 2}
+    transforms:
+      - classify_ip: {}
+
+  upstream_failures_total: {kind: count, optional: true,
+                            filter: *upstream_fail}
+
+  hourly_upstream_failures:
+    kind: date_histogram
+    interval: hour
+    optional: true
+    filter: *upstream_fail
+
+  upstream_failure_domains:
+    kind: terms
+    field: domain
+    size: $top_n
+    optional: true
+    filter: *upstream_fail
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+      kinds: {kind: top_terms, field: event_action, size: 2}
+      backend: {kind: top_terms, field: upstream, size: 1}
+
   # -- previous window, for trend arrows ------------------------------------
-  prev_total: {kind: count, window: previous}
-  prev_visitors: {kind: cardinality, field: client_ip, window: previous}
-  prev_bytes: {kind: sum, field: response_bytes, window: previous}
+  prev_total: {kind: count, window: previous, filter: *access_line}
+  prev_visitors: {kind: cardinality, field: client_ip, window: previous,
+                  filter: *access_line}
+  prev_bytes: {kind: sum, field: response_bytes, window: previous,
+               filter: *access_line}
   prev_errors: {kind: count, window: previous, filter: *real_errors}
 
 # ---------------------------------------------------------------------------
@@ -552,6 +757,11 @@ computed:
            + (1 if c.has_high else 0)
            + (1 if (q.probe_unique_ips or 0) >= 50 else 0)
            + (1 if (q.auth_denied or 0) >= 100 else 0)"
+
+  # Edge/WAF totals (None-safe; stay 0 on estates without the fields).
+  - {name: waf_blocked, expr: "q.waf_total or 0"}
+  - {name: rate_limited, expr: "q.rate_limited_total or 0"}
+  - {name: upstream_failed, expr: "q.upstream_failures_total or 0"}
 
 # ---------------------------------------------------------------------------
 badges:
@@ -623,6 +833,23 @@ insights:
       ({{ "%.1f" | format(pct(q.countries[1:4] | map(attribute='count')
       | sum, ext)) }}% combined).
 
+  # Multi-domain estates only (q.domains stays empty elsewhere).
+  - when: "q.domains"
+    text: >
+      Traffic spanned {{ human_int(q.domain_count) }} distinct domains
+      (virtual hosts). The busiest was {{ q.domains[0].key }} with
+      {{ human_int(q.domains[0].count) }} requests
+      ({{ "%.1f" | format(pct(q.domains[0].count, c.total)) }}% of all
+      traffic) from {{ human_int(q.domains[0].visitors) }} visitors —
+      the full breakdown is under Traffic by domain.
+
+  - when: "q.edge_servers and q.edge_servers | length > 1"
+    text: >
+      Requests were served by {{ q.edge_servers | length }} edge nodes
+      ({% for s in q.edge_servers[:3] %}{{ s.key }}
+      {{ "%.0f" | format(pct(s.count, c.total)) }}%
+      {{- ", " if not loop.last }}{% endfor %}).
+
   - when: "q.client_error_codes and q.client_error_codes | length > 1"
     text: >
       {% set top = q.client_error_codes[0] %}
@@ -680,6 +907,47 @@ insights:
       Security Signals.{% else %}No site area answered a probe with
       content.{% endif %}
 
+  - when: "q.probe_domains and q.probe_domains | length > 1"
+    text: >
+      Scanning touched {{ q.probe_domains | length }}{{ "+" if
+      q.probe_domains | length >= params.top_n }} domains; the most
+      probed was {{ q.probe_domains[0].key }}
+      ({{ human_int(q.probe_domains[0].count) }} probes from
+      {{ human_int(q.probe_domains[0].sources) }} sources).
+
+  - when: "(q.waf_total or 0) > 0"
+    text: >
+      The NAXSI WAF denied {{ human_int(q.waf_total) }} requests at the
+      edge ({{ "%.2f" | format(pct(q.waf_total, c.total + c.waf_blocked))
+      }}% of all handled traffic) from
+      {{ human_int(q.waf_sources_count) }} distinct sources
+      {%- if q.waf_categories %} — chiefly
+      {{ q.waf_categories[:2] | map(attribute='key') | join(' and ') }}
+      patterns{% endif %}
+      {%- if q.waf_domains %}; the most-targeted vhost was
+      {{ q.waf_domains[0].key }}
+      ({{ human_int(q.waf_domains[0].count) }} blocks){% endif %}.
+      Blocked requests never reach the access log, so they are additional
+      to every traffic figure above.
+
+  - when: "(q.rate_limited_total or 0) > 0"
+    text: >
+      Rate limiting throttled {{ human_int(q.rate_limited_total) }}
+      requests{% if q.rate_limited_ips %}; the most-limited client was
+      {{ q.rate_limited_ips[0].key }} with
+      {{ human_int(q.rate_limited_ips[0].count) }} hits{% endif %} — see
+      Edge health.
+
+  - when: "(q.upstream_failures_total or 0) > 0"
+    text: >
+      {{ human_int(q.upstream_failures_total) }} requests failed at the
+      upstream (backend) hop{% if q.upstream_failure_domains %} —
+      concentrated on {{ q.upstream_failure_domains[0].key }}
+      ({{ human_int(q.upstream_failure_domains[0].count) }} failures
+      affecting {{ human_int(q.upstream_failure_domains[0].clients) }}
+      clients){% endif %}. The backends involved are listed under Edge
+      health.
+
   - when: "(q.bots_total or 0) > 0"
     text: >
       Automated agents (crawlers, scripted clients, monitoring) accounted
@@ -734,6 +1002,39 @@ actions:
       5xx rate is {{ "%.2f" | format(c.srv_error_rate) }}%
       ({{ human_int(c.err_5xx) }} requests). Review the upstream
       application pool and the paths listed under Server Errors.
+
+  - when: "q.waf_ips and q.waf_ips[0].count >= params.waf_ip_action_min"
+    priority: P2
+    owner: "SOC"
+    text: >
+      {{ q.waf_ips[0].key }} ({{ q.waf_ips[0].location }}) triggered
+      {{ human_int(q.waf_ips[0].count) }} NAXSI blocks
+      ({{ q.waf_ips[0].cats }}) across
+      {{ human_int(q.waf_ips[0].domains) }} vhost(s). Add it to the edge
+      blocklist / fail2ban, and check the access log for anything it did
+      NOT get blocked on.
+
+  - when: "c.upstream_failed >= params.upstream_fail_warn"
+    priority: P2
+    owner: "Web team"
+    text: >
+      {{ human_int(c.upstream_failed) }} requests failed at the upstream
+      hop{% if q.upstream_failure_domains %}, chiefly
+      {{ q.upstream_failure_domains[:2] | map(attribute='key')
+         | join(' and ') }}{% endif %}. Check the backend pools — Edge
+      health names the exact backends. This is user-visible
+      unavailability that never appears in the application's own logs.
+
+  - when: "q.rate_limited_ips and
+           q.rate_limited_ips[0].count >= params.rl_ip_review_min"
+    priority: P3
+    owner: "SOC"
+    text: >
+      {{ q.rate_limited_ips[0].key }} hit the rate limiter
+      {{ human_int(q.rate_limited_ips[0].count) }} times (zones:
+      {{ q.rate_limited_ips[0].zones }}). Persistent limiter pressure is
+      either an aggressive crawler to block outright, or a legitimate
+      integration that needs a whitelist entry.
 
   - when: "(q.auth_denied or 0) > 0"
     priority: P3
@@ -794,6 +1095,21 @@ sections:
          foot: "{{ 'REVIEW REQUIRED' if (q.probe_served_total or 0) > 0
                 else 'all probes rejected' }}"}
 
+  # Edge/WAF KPI strip - only on estates whose datasource maps the WAF and
+  # edge-error fields (nginx); everywhere else the row is not rendered.
+  - type: kpi_row
+    show_if: "q.waf_total is not none or q.rate_limited_total is not none"
+    items:
+      - {label: "WAF blocks (NAXSI)", value: "c.waf_blocked", format: int,
+         style: "'warn' if c.waf_blocked > 0 else 'ok'",
+         foot: "{{ human_int(q.waf_sources_count) }} distinct sources"}
+      - {label: "Rate-limited", value: "c.rate_limited", format: int}
+      - {label: "Upstream failures", value: "c.upstream_failed",
+         format: int,
+         style: "'crit' if c.upstream_failed >= params.upstream_fail_warn
+                 else 'ok'"}
+      - {label: "Domains served", value: "q.domain_count", format: int}
+
   # ---- traffic ------------------------------------------------------------
   - {type: heading, title: "Traffic overview"}
   - type: timeseries
@@ -827,6 +1143,24 @@ sections:
              addressing has no public geolocation."
       show_note_if: "q.internal_requests"
 
+  # Multi-domain estates: which vhosts carried the traffic. Single-site
+  # estates (no `domain` mapping) skip this table.
+  - type: table
+    title: "Traffic by domain (virtual host)"
+    query: domains
+    skip_if_unmapped: [domain]
+    hide_if_empty: true
+    note: "{{ human_int(q.domain_count) }} distinct domains were served in
+           this window; the table shows the busiest 15. Err % counts
+           4xx/5xx with client aborts excluded; 5xx alone is broken out."
+    columns:
+      - {key: key, label: "Domain", max: 34}
+      - {key: count, label: "Requests", format: int}
+      - {key: visitors, label: "Visitors", format: int}
+      - {key: err_pct, label: "Err %", format: pct}
+      - {key: err5xx, label: "5xx", format: int}
+      - {key: bytes, label: "Bandwidth", format: bytes}
+
   - type: bars
     title: "Top requested paths"
     query: top_urls
@@ -837,6 +1171,18 @@ sections:
            show_pct: true}
     right: {type: bars, title: "Top referrers", query: referrers,
             color: teal}
+
+  - type: table
+    title: "Traffic by edge server"
+    query: edge_servers
+    skip_if_unmapped: [edge_server]
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Edge node", format: mono, max: 26}
+      - {key: count, label: "Requests", format: int}
+      - {key: visitors, label: "Visitors", format: int}
+      - {key: err_pct, label: "Err %", format: pct}
+      - {key: bytes, label: "Bandwidth", format: bytes}
 
   # ---- errors ---------------------------------------------------------------
   - {type: heading, title: "Errors & availability"}
@@ -925,6 +1271,21 @@ sections:
       - {key: served, label: "Served 2xx", format: int}
       - {key: top_path, label: "Most-probed path", format: mono, max: 38}
 
+  - type: table
+    title: "Scanning by domain"
+    query: probe_domains
+    skip_if_unmapped: [domain]
+    hide_if_empty: true
+    note: "Signature-matching requests grouped by the vhost they
+           targeted. 'Served 2xx' above zero means a probe somewhere on
+           that domain was answered with content."
+    columns:
+      - {key: key, label: "Domain", max: 32}
+      - {key: count, label: "Probes", format: int}
+      - {key: sources, label: "Sources", format: int}
+      - {key: served, label: "Served 2xx", format: int}
+      - {key: top_path, label: "Most-probed path", format: mono, max: 36}
+
   - type: bars
     title: "Most-probed paths"
     query: probe_paths
@@ -996,6 +1357,141 @@ sections:
       - {key: count, label: "Requests", format: int}
       - {key: ips, label: "IPs", format: int}
       - {key: bytes, label: "Bandwidth", format: bytes}
+
+  # ---- WAF (estates whose datasource maps the NAXSI fields: nginx) ----------
+  - {type: heading, title: "WAF activity (NAXSI)",
+     hint: "requests denied at the edge - they never reach the access log",
+     show_if: "(q.waf_total or 0) > 0"}
+
+  - type: timeseries
+    title: "WAF blocks per hour"
+    query: hourly_waf
+    skip_if_unmapped: [event_action]
+    show_if: "(q.waf_total or 0) > 0"
+    color: red
+    series_label: "blocked requests / hour"
+
+  - type: row
+    show_if: "(q.waf_total or 0) > 0"
+    left:
+      type: bars
+      title: "Blocks by attack category"
+      query: waf_categories
+      skip_if_unmapped: [waf_rule_category]
+      color: red
+      show_pct: true
+    right:
+      type: bars
+      title: "Blocks by match zone"
+      query: waf_zones
+      skip_if_unmapped: [waf_zone]
+      color: amber
+      show_pct: true
+      note: "Zone = where the pattern matched: URL, ARGS (query string),
+             BODY, HEADERS (usually cookies)."
+
+  - type: table
+    title: "Top WAF rules"
+    query: waf_rules
+    skip_if_unmapped: [waf_rule_id]
+    hide_if_empty: true
+    note: "NAXSI core rule ids: 1000-1099 SQL, 1100-1199 RFI/scheme,
+           1200-1299 traversal, 1300-1399 XSS; ids below 1000 are NAXSI
+           internal anomalies (malformed/oversized requests). One benign
+           application pattern tripping a single rule at volume (e.g.
+           cookies hitting 1315) is whitelist-tuning input, not an
+           attack."
+    columns:
+      - {key: key, label: "Rule id", format: mono}
+      - {key: category, label: "Category"}
+      - {key: count, label: "Blocks", format: int}
+      - {key: ips, label: "Sources", format: int}
+      - {key: zones, label: "Zones", format: mono, max: 20}
+      - {key: top_domain, label: "Top vhost", max: 28}
+
+  - type: row
+    show_if: "(q.waf_total or 0) > 0"
+    left:
+      type: table
+      title: "Most-blocked sources"
+      query: waf_ips
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Source IP", format: mono, width: 104,
+           nowrap: true}
+        - {key: scope, label: "Class", format: pill,
+           pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+        - {key: count, label: "Blocks", format: int}
+        - {key: cats, label: "Categories", format: mono, max: 14}
+        - {key: top_domain, label: "Top vhost", max: 22}
+    right:
+      type: table
+      title: "Most-targeted vhosts"
+      query: waf_domains
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Domain", max: 26}
+        - {key: count, label: "Blocks", format: int}
+        - {key: sources, label: "Sources", format: int}
+        - {key: top_cat, label: "Top category"}
+
+  # ---- edge health (nginx estates: limiter + upstream visibility) -----------
+  - {type: heading, title: "Edge health (rate limiting & upstreams)",
+     show_if: "q.edge_error_breakdown"}
+
+  - type: table
+    title: "Edge error breakdown"
+    query: edge_error_breakdown
+    skip_if_unmapped: [event_action]
+    hide_if_empty: true
+    note: "Everything the edge logged besides normal access lines:
+           rate/connection limiting (protection doing its job), upstream
+           failures (a backend problem), SSL-handshake noise, and
+           anything unclassified."
+    columns:
+      - {key: key, label: "Event", format: mono, max: 36}
+      - {key: count, label: "Events", format: int}
+      - {key: ips, label: "Sources", format: int}
+      - {key: domains, label: "Domains", format: int}
+
+  - type: timeseries
+    title: "Upstream failures per hour"
+    query: hourly_upstream_failures
+    skip_if_unmapped: [event_action]
+    show_if: "(q.upstream_failures_total or 0) > 0"
+    color: red
+    series_label: "failed upstream requests / hour"
+    note: "Requests nginx accepted but could not hand to a backend
+           (connection refused / timed out) - user-visible errors that
+           appear in no application log."
+
+  - type: row
+    show_if: "(q.upstream_failures_total or 0) > 0
+              or (q.rate_limited_total or 0) > 0"
+    left:
+      type: table
+      title: "Upstream failures by domain"
+      query: upstream_failure_domains
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Domain", max: 26}
+        - {key: count, label: "Failures", format: int}
+        - {key: clients, label: "Clients hit", format: int}
+        - {key: kinds, label: "Failure kinds", format: mono, max: 30}
+        - {key: backend, label: "Backend", format: mono, max: 30}
+    right:
+      type: table
+      title: "Most rate-limited clients"
+      query: rate_limited_ips
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Client IP", format: mono, width: 104,
+           nowrap: true}
+        - {key: scope, label: "Class", format: pill,
+           pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+        - {key: count, label: "Limited", format: int}
+        - {key: zones, label: "Zones", format: mono, max: 24}
+        - {key: domains, label: "Domains", format: mono, max: 24}
 
   # ---- sources & bandwidth ---------------------------------------------------
   - {type: heading, title: "Traffic sources"}

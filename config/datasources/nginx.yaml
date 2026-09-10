@@ -1,15 +1,22 @@
 # ===========================================================================
-# Datasource: nginx reverse-proxy access logs (parsed by foss-soc-engine).
+# Datasource: nginx reverse-proxy edge (parsed by foss-soc-engine).
 #
-# A datasource file answers exactly three questions:
-#   1. WHERE the documents live               (index)
-#   2. WHAT the logical fields are called     (fields)
-#   3. what is DIFFERENT about this estate    (params overrides)
+# Since the multi-vhost rollout this edge fronts the whole campus web
+# estate (~115 domains, vh3/vh4 nodes), and the index carries THREE
+# document shapes, told apart by event.type:
+#   * access  - one per served request (has http.response.status_code)
+#   * error   - nginx error-log lines: rate/connection limiting,
+#               upstream connect/timeout failures, SSL handshake noise
+#               (event.action names the kind; no status code)
+#   * denied  - NAXSI WAF blocks (event.action: waf_block, rule.* and
+#               nginx.naxsi.* carry the rule, category, zone)
+# The report scopes traffic metrics to access lines via `status_code
+# exists`; the WAF and edge-health sections read the other two shapes.
 #
-# The `fields:` map translates the LOGICAL names used by report definitions
-# into the concrete fields of this index - including any .keyword suffix a
-# field needs to be aggregatable. Field names below were verified against
-# the live fosstlsoc-logs-nginx* mapping.
+# The `fields:` map translates the LOGICAL names used by report
+# definitions into the concrete fields of this index - including any
+# .keyword suffix a field needs to be aggregatable. Verified against the
+# live fosstlsoc-logs-nginx* mapping (framework check-fields).
 #
 # A logical field that does not exist here is simply left out: every
 # report section that depends on it is omitted automatically.
@@ -31,10 +38,36 @@ fields:
   user_agent: "user_agent.original.keyword"
   geo_country: "source.geo.country_name"        # keyword, NO .keyword
   geo_city: "source.geo.city_name"
-  service: "service.name.keyword"               # vhost/site label
-  # vhost (host.name / vh3 / vh4) is NOT indexed on this estate - it only
-  # exists inside event.original. Once log engineering maps it at parse
-  # time, add:  vhost: "host.name"  and the per-vhost sections light up.
+
+  # The virtual host the request addressed ($host, first token of the
+  # vhost-first log format). Present on access AND error/denied docs, so
+  # the per-domain traffic, scanning, WAF and upstream tables all share it.
+  domain: "url.domain.keyword"
+  # The edge node that served the request (vh3.iitb.ac.in / vh4.iitb.ac.in).
+  edge_server: "host.name.keyword"
+  # Source-side ASN enrichment (org name); mapped for future use.
+  asn_org: "source.as.organization.name.keyword"
+
+  # -- error/denied documents only ----------------------------------------
+  # rate_limit / connection_limit / waf_block / upstream_connection_refused
+  # / upstream_timeout / upstream_connect_failed / ssl_handshake_failure /
+  # nginx_error_unclassified ... Absent on access lines, which is what
+  # keeps the edge tables scoped without an extra filter.
+  event_action: "event.action.keyword"
+  # NAXSI (event.action: waf_block): first matched rule broken out.
+  waf_rule_id: "rule.id.keyword"                # 1000-1399 core, <1000 internal
+  waf_rule_category: "rule.category.keyword"    # $SQL / $XSS / $RFI / $TRAVERSAL
+  waf_zone: "nginx.naxsi.zone.keyword"          # URL / ARGS / BODY / HEADERS
+  waf_mode: "nginx.naxsi.mode.keyword"          # block / drop / learning
+  # nginx limit_req zone that fired (ip_domain_high / ip_domain_medium ...).
+  rate_limit_zone: "nginx.rate_limit.zone.keyword"
+  # Backend URL a failed upstream attempt targeted.
+  upstream: "nginx.upstream.keyword"
+
+  # service.name is intentionally NOT mapped any more: since the vhost-first
+  # format it only distinguishes the syslog program (vhnginx_access /
+  # vhnginx_error), which is a document-shape label, not a site. The
+  # per-site dimension is `domain` above.
 
 params:
   # Load balancers, reverse proxies and monitoring in front of this estate,
@@ -46,15 +79,11 @@ params:
   # internal_cidrs:
   #   - "103.21.124.0/22"
 
-  # Site areas: this proxy fronts ONE Drupal estate (iitb.ac.in) whose
-  # sections are mounted under path prefixes. The logs carry no Host header,
-  # so the section a request targeted is only knowable from url.path - this
-  # list is what lets the report break scanning/exposure down by section.
-  # Add/rename freely; anything under no prefix is reported as the main site.
-  # To find more sections: look at the top url.path first-segments in a
-  # recent report, or run a terms agg on url.path.keyword.
-  # Name shown for the site root and shared paths (everything under no
-  # site_areas prefix). This estate is a single Drupal site.
+  # Site areas: path-mounted sections of the MAIN Drupal estate
+  # (www.iitb.ac.in). With ~115 vhosts on this edge the headline
+  # segmentation is now the per-domain tables; these path prefixes still
+  # break the main site itself into its sections (they are distinctive
+  # enough not to collide with other vhosts' paths).
   main_site_name: "www.iitb.ac.in (main site)"
 
   site_areas:
@@ -68,8 +97,9 @@ params:
     - {name: "Career / Recruitment",   prefix: "/career"}
     - {name: "Breaking News",          prefix: "/breaking-news"}
 
-  # First-party application paths on THIS estate (Drupal). Extends the
-  # report's benign allowlist so core assets never count as probes.
+  # First-party application paths on this estate (Drupal across most
+  # vhosts). Extends the report's benign allowlist so core assets never
+  # count as probes.
   extra_benign_path_prefixes:
     - "/core/assets/"
     - "/core/misc/"
@@ -82,7 +112,7 @@ params:
     - "/profiles/"
     - "/sites/default/files/"
 
-  # Login/credential surface for Drupal + SSO.
+  # Login/credential surface for Drupal + SSO (matches on any vhost).
   auth_path_patterns:
     - "/user/login*"
     - "/user/password*"

@@ -9,6 +9,36 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Multi-domain (vhost) breakdown for web reports.** Estates whose
+  datasource maps a `domain` logical field (nginx: `url.domain` from the
+  vhost-first log format, ~115 domains) gain a per-domain traffic table
+  (requests, visitors, Err %, 5xx, bandwidth, distinct-domain count),
+  a "Scanning by domain" table on the security side, a "Traffic by edge
+  server" table (`edge_server`: vh3/vh4), an executive-summary line
+  naming the busiest vhost, and a "Domains served" KPI. Single-site
+  estates render exactly as before.
+- **NAXSI WAF section for web reports.** The edge's `denied` documents
+  (`event.action: waf_block`) get their own block: blocks-per-hour
+  timeseries, attack-category ($SQL/$XSS/$RFI/$TRAVERSAL) and match-zone
+  charts, a top-rules table (id-range legend plus a whitelist-tuning
+  note), most-blocked sources, most-targeted vhosts, a WAF/edge KPI
+  strip, and a P2 action when one source exceeds `waf_ip_action_min`
+  blocks. The summary states blocked volume as additional to access
+  traffic — a denied request never reaches the access log.
+- **Edge-health section for web reports.** nginx `error` documents
+  render as an edge error breakdown (rate/connection limiting, upstream
+  failures, SSL-handshake noise, unclassified), an upstream-failures-
+  per-hour timeseries, upstream failures by domain (clients hit,
+  failure kinds, exact backend), and most rate-limited clients — with
+  P2/P3 actions on the `upstream_fail_warn` / `rl_ip_review_min`
+  thresholds. Backend outages that never appear in any application log
+  are now visible per domain.
+- nginx datasource: mapped `domain`, `edge_server`, `event_action`,
+  `waf_rule_id`, `waf_rule_category`, `waf_zone`, `waf_mode`,
+  `rate_limit_zone`, `upstream`, `asn_org`; unmapped `service` (since
+  the vhost-first format, `service.name` only distinguishes the syslog
+  program - `vhnginx_access` / `vhnginx_error` - not a site).
+
 - **DNS log source + daily DNS report** (`dns_daily` × `dns`). New `dns`
   datasource for the campus PowerDNS dnsdist resolvers
   (`fosstlsoc-logs-dns*`, parsed by foss-soc-engine `rules/dns.yaml`,
@@ -120,6 +150,15 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
   that automated delivery matches on stays stable across renames.
 
 ### Fixed
+
+- Web-report traffic metrics no longer count nginx error and WAF
+  documents. Since the multi-vhost + NAXSI rollout the nginx index mixes
+  three document shapes, and every unfiltered metric (total requests,
+  visitors, top paths/IPs, referrers, methods, bandwidth, geography,
+  auth surface, signature-probe detection, trend baselines) silently
+  included ~11% error/denied lines - the status-mix donut showed them as
+  "No status logged". Traffic queries are now scoped to access lines
+  (`status_code` exists), a no-op for pure access-log estates (moodle).
 
 - Reports are now named after the day their data actually covers. A window
   ending exactly at midnight (`--window-end 2026-07-17T23:59`) was filed
