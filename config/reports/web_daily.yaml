@@ -213,6 +213,8 @@ queries:
       all:
         - {field: status_code, range: {gte: 400, lt: 500}}
         - none: [{field: status_code, in_param: client_abort_codes}]
+    sub_aggs:
+      domains: {kind: top_terms, field: domain, size: 2}
 
   # 5xx rolled up by path prefix: individually-listed 5xx paths hide storms
   # (hundreds of unique generated URLs at a few hits each).
@@ -223,8 +225,9 @@ queries:
     filter: {field: status_code, range: {gte: 500, lt: 600}}
     sub_aggs:
       codes: {kind: top_terms, field: status_code, size: 3}
+      domains: {kind: top_terms, field: domain, size: 2}
     transforms:
-      - cluster_paths: {depth: 4, collect: [codes]}
+      - cluster_paths: {depth: 4, collect: [codes, domains]}
       - limit: {size: $top_n}
 
   # Which client errors, not just how many. A 4xx total is unactionable on
@@ -269,6 +272,7 @@ queries:
             - {signatures: web_threats}
             - {field: url_path, prefix_param: expected_404_prefixes}
     sub_aggs:
+      domains: {kind: top_terms, field: domain, size: 2}
       referrer: {kind: top_terms, field: referrer, size: 1, missing: "-"}
 
   methods: {kind: terms, field: method, size: $top_n, optional: true,
@@ -286,6 +290,7 @@ queries:
     sub_aggs:
       ips: {kind: top_terms, field: client_ip, size: 3}
       paths: {kind: top_terms, field: url_path, size: 2}
+      domains: {kind: top_terms, field: domain, size: 2}
       codes: {kind: top_terms, field: status_code, size: 3}
 
   referrers:
@@ -370,6 +375,7 @@ queries:
     filter: *access_line
     sub_aggs:
       bytes: {kind: sum, field: response_bytes}
+      domains: {kind: top_terms, field: domain, size: 2}
 
   bandwidth_ips:
     kind: terms
@@ -393,6 +399,7 @@ queries:
       unique_ips: {kind: cardinality, field: client_ip}
       top_path: {kind: top_terms, field: url_path, size: 1}
       top_ip: {kind: top_terms, field: client_ip, size: 1}
+      top_domain: {kind: top_terms, field: domain, size: 1}
       served: {kind: filter,
                filter: {field: status_code, in_param: probe_success_codes}}
 
@@ -411,6 +418,9 @@ queries:
     field: url_path
     size: $top_n
     filter: *threat_scope
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+      domains: {kind: top_terms, field: domain, size: 2}
 
   probe_served_paths:
     kind: terms
@@ -422,6 +432,7 @@ queries:
         - {field: status_code, in_param: probe_success_codes}
     sub_aggs:
       ip: {kind: top_terms, field: client_ip, size: 1}
+      domains: {kind: top_terms, field: domain, size: 2}
 
   # Scanning & exposure per site area. path_groups buckets probe traffic by
   # the configured site_areas prefixes (+ a main-site bucket for everything
@@ -460,6 +471,7 @@ queries:
       city: {kind: top_terms, field: geo_city, size: 1}
       ua: {kind: top_terms, field: user_agent, size: 1}
       unique_paths: {kind: cardinality, field: url_path}
+      vhosts: {kind: cardinality, field: domain}
       served: {kind: filter,
                filter: {field: status_code, in_param: probe_success_codes}}
     transforms:
@@ -469,7 +481,7 @@ queries:
     kind: samples
     size: 8
     filter: *serious_scope
-    fields: [timestamp, client_ip, geo_country, method, url_path,
+    fields: [timestamp, client_ip, geo_country, method, domain, url_path,
              status_code, user_agent]
 
   # -- authentication surface ---------------------------------------------
@@ -507,6 +519,7 @@ queries:
     sub_aggs:
       country: {kind: top_terms, field: geo_country, size: 1}
       posts: {kind: filter, filter: {field: method, equals: "POST"}}
+      sites: {kind: top_terms, field: domain, size: 2}
     transforms:
       - classify_ip: {}
 
@@ -891,7 +904,9 @@ insights:
       The most persistent scanner was {{ q.probe_ips[0].key }}
       ({{ q.probe_ips[0].location }}) with
       {{ human_int(q.probe_ips[0].count) }} probe requests across
-      {{ human_int(q.probe_ips[0].unique_paths) }} distinct paths.
+      {{ human_int(q.probe_ips[0].unique_paths) }} distinct paths
+      {%- if q.probe_ips[0].vhosts %} on
+      {{ human_int(q.probe_ips[0].vhosts) }} domain(s){% endif %}.
 
   # Only when the estate declares site_areas. Names the most-scanned area
   # and flags any area that answered a probe with content.
@@ -1197,10 +1212,14 @@ sections:
              401/403 rejected access, 404 missing resources,
              405 wrong method, 429 rate-limited."
     right:
-      type: bars
+      type: table
       title: "Top client-error (4xx) paths"
       query: top_4xx_paths
-      color: amber
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Path", format: mono, max: 26}
+        - {key: count, label: "Hits", format: int}
+        - {key: domains, label: "Domain(s)", max: 22}
 
   - type: table
     title: "Server errors (5xx), clustered by path prefix"
@@ -1209,8 +1228,9 @@ sections:
     note: "Clustering by prefix makes error storms visible as one row
            instead of hundreds of unique URLs."
     columns:
-      - {key: key, label: "Path prefix", format: mono, max: 62}
+      - {key: key, label: "Path prefix", format: mono, max: 44}
       - {key: paths, label: "Distinct paths", format: int}
+      - {key: domains, label: "Domain(s)", max: 26}
       - {key: codes, label: "Codes"}
       - {key: count, label: "Requests", format: int}
 
@@ -1222,9 +1242,10 @@ sections:
            {{ human_int(q.c404_expected) }} expected discovery-path 404s
            are excluded — this list is actionable by the web team."
     columns:
-      - {key: key, label: "Missing path", format: mono, max: 52}
+      - {key: key, label: "Missing path", format: mono, max: 40}
       - {key: count, label: "Hits", format: int}
-      - {key: referrer, label: "Top referrer", max: 40}
+      - {key: domains, label: "Domain(s)", max: 28}
+      - {key: referrer, label: "Top referrer", max: 30}
 
   - type: table
     title: "Unusual (write) HTTP methods reaching the origin"
@@ -1233,8 +1254,9 @@ sections:
     columns:
       - {key: key, label: "Method"}
       - {key: count, label: "Requests", format: int}
-      - {key: ips, label: "Top sources", format: mono, max: 44}
-      - {key: paths, label: "Top paths", format: mono, max: 44}
+      - {key: ips, label: "Top sources", format: mono, max: 34}
+      - {key: paths, label: "Top paths", format: mono, max: 34}
+      - {key: domains, label: "Domain(s)", max: 30}
       - {key: codes, label: "Codes"}
 
   # ---- security ---------------------------------------------------------------
@@ -1251,7 +1273,8 @@ sections:
       - {key: count, label: "Hits", format: int}
       - {key: unique_ips, label: "Sources", format: int}
       - {key: served, label: "Served 2xx", format: int}
-      - {key: top_path, label: "Most-hit path", format: mono, max: 40}
+      - {key: top_domain, label: "Domain", max: 22}
+      - {key: top_path, label: "Most-hit path", format: mono, max: 28}
       - {key: top_ip, label: "Top source", format: mono, width: 104, nowrap: true}
 
   - type: table
@@ -1286,10 +1309,15 @@ sections:
       - {key: served, label: "Served 2xx", format: int}
       - {key: top_path, label: "Most-probed path", format: mono, max: 36}
 
-  - type: bars
+  - type: table
     title: "Most-probed paths"
     query: probe_paths
-    color: red
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Path", format: mono, max: 44}
+      - {key: count, label: "Probes", format: int}
+      - {key: sources, label: "Sources", format: int}
+      - {key: domains, label: "Domain(s)", max: 34}
 
   - type: table
     title: "Probe sources"
@@ -1302,8 +1330,9 @@ sections:
       - {key: location, label: "Location", max: 24}
       - {key: count, label: "Probes", format: int}
       - {key: unique_paths, label: "Paths", format: int}
+      - {key: vhosts, label: "Domains", format: int}
       - {key: served, label: "Served 2xx", format: int}
-      - {key: ua, label: "User agent", max: 34}
+      - {key: ua, label: "User agent", max: 28}
 
   - type: table
     title: "⚠ Probe paths answered with 2xx content"
@@ -1313,8 +1342,9 @@ sections:
            matches an attack signature (tune the allowlist) or a real
            exposure (block and investigate)."
     columns:
-      - {key: key, label: "Path", format: mono, max: 56}
+      - {key: key, label: "Path", format: mono, max: 44}
       - {key: count, label: "Hits", format: int}
+      - {key: domains, label: "Domain(s)", max: 30}
       - {key: ip, label: "Top source", format: mono, width: 104, nowrap: true}
 
   - type: samples
@@ -1326,7 +1356,8 @@ sections:
       - {key: client_ip, label: "Source", format: mono, width: 104, nowrap: true}
       - {key: geo_country, label: "Country", max: 16}
       - {key: method, label: "Method"}
-      - {key: url_path, label: "Path", format: mono, max: 46}
+      - {key: domain, label: "Domain", max: 22}
+      - {key: url_path, label: "Path", format: mono, max: 34}
       - {key: status_code, label: "Status"}
 
   - type: table
@@ -1343,6 +1374,7 @@ sections:
       - {key: country, label: "Country", max: 20}
       - {key: count, label: "Requests", format: int}
       - {key: posts, label: "POSTs", format: int}
+      - {key: sites, label: "Domain(s)", max: 30}
 
   - type: table
     title: "Automated agents (bots, scripts, monitors)"
@@ -1528,8 +1560,9 @@ sections:
       title: "Bandwidth by path"
       query: bandwidth_paths
       columns:
-        - {key: key, label: "Path", format: mono, max: 30}
+        - {key: key, label: "Path", format: mono, max: 24}
         - {key: count, label: "Hits", format: int}
+        - {key: domains, label: "Domain(s)", max: 20}
         - {key: bytes, label: "Bytes", format: bytes}
     right:
       type: table
