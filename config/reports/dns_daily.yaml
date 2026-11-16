@@ -43,12 +43,16 @@ params:
   # One client collecting this many NXDOMAIN answers in a day is the DGA /
   # misconfigured-agent trigger (campus average is ~140 per client).
   nxdomain_client_min: 1000
-  # Volume alone is not a DGA: a host retrying ONE stale name (an NTP pool
-  # that no longer exists) racks up thousands of NXDOMAINs too. Malware
-  # that generates domains churns through MANY distinct names, so the
-  # malware action needs at least this many; below it the host is reported
-  # as a stale-configuration case instead.
-  dga_names_min: 50
+  # What generated-domain (DGA) malware looks like in resolver logs:
+  # HUNDREDS of different non-existent names, each asked only a few times.
+  # A host that repeats a handful of names thousands of times is a retry
+  # loop (stale setting, search-suffix expansion, a tool that cannot reach
+  # its server) - it is reported for the load it causes, not as malware.
+  dga_names_min: 500
+  dga_repeat_max: 20               # average lookups per name, at most
+  # One client collecting this many NXDOMAIN answers is loading the
+  # resolvers enough to raise the retry-loop action from P4 to P3.
+  nx_loop_load_min: 1000000
   # Names that legitimately fail in bulk and say nothing about malware:
   # service discovery (_ldap._tcp.dc._msdcs..., _sip._tcp...) and reverse /
   # mDNS-style zones.
@@ -179,6 +183,7 @@ queries:
       - classify_ip: {}
       - min_count: {value: $nxdomain_client_min}
       - min_count: {key: domains, value: $dga_names_min}
+      - derive_pct: {num: count, den: domains, to: repeat_x100}
       - limit: {size: $top_n}
 
   refused_clients:
@@ -288,10 +293,17 @@ computed:
            | selectattr('domains', 'ge', params.tunnel_names_min) | list"
   # Clients with NXDOMAIN volume but too few distinct names for a DGA:
   # repeated lookups of the same missing name (stale configuration).
+  - name: dga_shaped
+    expr: "(q.dga_suspects or [])
+           | selectattr('repeat_x100', 'le', params.dga_repeat_max * 100)
+           | list"
+  # Heavy NXDOMAIN clients that are NOT DGA-shaped: retry loops.
   - name: stale_nx
     expr: "(q.nxdomain_clients or [])
            | selectattr('count', 'ge', params.nxdomain_client_min)
-           | selectattr('domains', 'lt', params.dga_names_min) | list"
+           | rejectattr('key', 'in',
+                        c.dga_shaped | map(attribute='key') | list)
+           | list"
   - {name: total, expr: "q.total_queries or 0"}
   - {name: answers, expr: "q.total_answers or 0"}
   - {name: nxdomain, expr: "q.nxdomain_total or 0"}
@@ -351,7 +363,7 @@ insights:
       {{ human_int(q.unique_domains) }} distinct names;
       {{ human_int(c.answers) }} answers were logged
       {%- if c.delta_queries is not none %}
-      ({{ "â–²" if c.delta_queries > 0 else "â–¼" }}
+      ({{ "▲" if c.delta_queries > 0 else "▼" }}
       {{ "%.1f" | format(c.delta_queries | abs) }}% vs previous
       {{ window.hours }}h){% endif %}.
 
@@ -378,21 +390,22 @@ insights:
       clients — a campus resolver should serve internal clients only.
       See the recommended actions.
 
-  - when: "q.dga_suspects"
+  - when: "c.dga_shaped"
     text: >
-      Client {{ q.dga_suspects[0].key }} collected
-      {{ human_int(q.dga_suspects[0].count) }} NXDOMAIN answers across
-      {{ human_int(q.dga_suspects[0].domains) }} distinct names —
-      see Security signals.
+      Client {{ c.dga_shaped[0].key }} failed lookups for
+      {{ human_int(c.dga_shaped[0].domains) }} different non-existent
+      names, each asked only a few times
+      ({{ human_int(c.dga_shaped[0].count) }} NXDOMAIN answers). That is
+      unusual for one host — see Security signals.
 
   - when: "c.stale_nx"
     text: >
       {{ c.stale_nx | length }} client(s) each collected thousands of
-      NXDOMAIN answers for only a handful of names (the top one,
+      NXDOMAIN answers by repeating the same names (the top one,
       {{ c.stale_nx[0].key }}: {{ human_int(c.stale_nx[0].count) }} answers
       for {{ human_int(c.stale_nx[0].domains) }} name(s), e.g.
-      {{ c.stale_nx[0].examples }}) — a client retrying the same missing
-      names, not malware.
+      {{ c.stale_nx[0].examples }}). That is the shape of a retry loop on
+      the client; the names show what it is trying to reach.
 
   - when: "c.servfail > 0 and q.servfail_domains"
     text: >
@@ -448,32 +461,44 @@ actions:
       ACLs and dnsdist client rules before this is abused for
       reflection/amplification.
 
-  - when: "q.dga_suspects"
+  - when: "c.dga_shaped"
     priority: P2
     owner: "SOC"
     text: >
-      Client {{ q.dga_suspects[0].key }}
-      ({{ q.dga_suspects[0].site }}) collected
-      {{ human_int(q.dga_suspects[0].count) }} NXDOMAIN answers across
-      {{ human_int(q.dga_suspects[0].domains) }} distinct names
-      (e.g. {{ q.dga_suspects[0].examples }}). Many different names that
-      do not exist is the pattern of malware that generates domains, and
-      also of some VPN and proxy tools. Look at the names: if they are
-      random-looking or sit under a dynamic-DNS provider, identify the
-      process behind the lookups on that host.
+      Client {{ c.dga_shaped[0].key }} ({{ c.dga_shaped[0].site }}) failed
+      lookups for {{ human_int(c.dga_shaped[0].domains) }} different
+      non-existent names, each asked only a few times
+      ({{ human_int(c.dga_shaped[0].count) }} NXDOMAIN answers, e.g.
+      {{ c.dga_shaped[0].examples }}). Hundreds of different missing names
+      from one host is unusual: malware that generates domains does this,
+      and so do scanners and tools working through a list of dead domains.
+      Check the names under Security signals, then identify the process
+      making the lookups on that host.
 
-  - when: "c.stale_nx"
+  # Same finding at two priorities: P3 when one client is loading the
+  # resolvers (nx_loop_load_min), P4 otherwise.
+  - when: "c.stale_nx and c.stale_nx[0].count < params.nx_loop_load_min"
     priority: P4
     owner: "Network team"
-    text: >
+    text: &nx_loop_text >
       {{ c.stale_nx[0].key }} ({{ c.stale_nx[0].site }}) collected
-      {{ human_int(c.stale_nx[0].count) }} NXDOMAIN answers for only
+      {{ human_int(c.stale_nx[0].count) }} NXDOMAIN answers
+      {%- if c.answers and pct(c.stale_nx[0].count, c.answers) >= 1 %}
+      ({{ "%.1f" | format(pct(c.stale_nx[0].count, c.answers)) }}% of all
+      answers the resolvers gave){% endif %} for only
       {{ human_int(c.stale_nx[0].domains) }} distinct name(s), e.g.
       {{ c.stale_nx[0].examples }}. A client repeating the same missing
-      names is a stale setting or a discovery service that cannot find its
-      target, not malware; fixing the client removes needless resolver
-      load.{%- if c.stale_nx | length > 1 %} {{ c.stale_nx | length - 1 }}
+      names is a retry loop: a stale setting, a search suffix being
+      appended, or software that cannot reach its server. The names show
+      which; if they are not something the owner recognises, treat the
+      host as suspect. Fixing or isolating the client removes the load.
+      {%- if c.stale_nx | length > 1 %} {{ c.stale_nx | length - 1 }}
       more client(s) behave the same; see the NXDOMAIN table.{% endif %}
+
+  - when: "c.stale_nx and c.stale_nx[0].count >= params.nx_loop_load_min"
+    priority: P3
+    owner: "Network team"
+    text: *nx_loop_text
 
   - when: "c.tunnel_shaped"
     priority: P2
@@ -701,6 +726,21 @@ sections:
       - {key: count, label: "NXDOMAIN", format: int}
       - {key: domains, label: "Distinct names", format: int}
       - {key: examples, label: "Example names", format: mono, max: 34}
+
+  - type: table
+    title: "Clients failing lookups for many different names"
+    rows: "c.dga_shaped"
+    hide_if_empty: true
+    note: "Hundreds of different non-existent names, each asked only a few
+           times. Generated-domain malware looks like this; so do scanners
+           and tools resolving a list of dead domains. The example names
+           are the first thing to read."
+    columns:
+      - {key: key, label: "Client IP", format: mono, width: 110, nowrap: true}
+      - {key: site, label: "Campus location", max: 22}
+      - {key: count, label: "NXDOMAIN", format: int}
+      - {key: domains, label: "Distinct names", format: int}
+      - {key: examples, label: "Example names", format: mono, max: 40}
 
   - type: table
     title: "Clients with heavy TXT/NULL/ANY query volume"
