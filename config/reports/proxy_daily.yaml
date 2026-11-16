@@ -35,6 +35,14 @@ params:
   # bypass), 1433/3306 = direct database access.
   unusual_ports: [22, 23, 25, 445, 3389, 5900, 1080, 4444, 6667, 9001,
                   9050, 6568, 5938, 853, 1433, 3306]
+  # Ports in the list above that are ROUTINE for a campus: researchers and
+  # admins SSH out to cloud VMs and remote labs every day, and the proxy
+  # policy permits it. They stay visible in the table but raise an action
+  # only on scan-like behaviour (below), never just for being used.
+  routine_ports: [22]
+  # One client opening tunnels to this many DISTINCT hosts on a routine port
+  # is scanning / brute-forcing, not administering a server.
+  routine_port_scan_min: 25
 
 queries:
   total_requests: {kind: count}
@@ -72,6 +80,20 @@ queries:
       denied: {kind: filter, filter: *denied}
     transforms:
       - classify_ip: {}
+      - derive_pct: {num: denied, den: count, to: denied_pct}
+
+  # Usage by campus location (hostel wing, department). Covers clients in
+  # mapped campus ranges only; unmapped clients are simply absent here.
+  site_usage:
+    kind: terms
+    field: location
+    size: $top_n
+    optional: true
+    sub_aggs:
+      clients: {kind: cardinality, field: client_ip}
+      bytes: {kind: sum, field: bytes}
+      denied: {kind: filter, filter: *denied}
+    transforms:
       - derive_pct: {num: denied, den: count, to: denied_pct}
 
   top_destinations:
@@ -145,15 +167,59 @@ queries:
       clients: {kind: cardinality, field: client_ip}
       ports: {kind: top_terms, field: dest_port, size: 3}
 
+  # Tunnels (CONNECT) to non-web ports. CONNECT only: for a plain HTTP
+  # request the logged "port" can be a fragment of an IPv6 address (the
+  # engine splits ...::3400:5900 into host ...::3400 and port 5900), which
+  # produced phantom VNC / TeamViewer ports in earlier reports.
   unusual_port_traffic:
     kind: terms
     field: dest_port
     size: 10
     optional: true
-    filter: {field: dest_port, in_param: unusual_ports}
+    filter:
+      all:
+        - {field: method, equals: CONNECT}
+        - {field: dest_port, in_param: unusual_ports}
+    sub_aggs:
+      allowed: {kind: filter, filter: {field: outcome, equals: success}}
+      clients: {kind: top_terms, field: client_ip, size: 3}
+      dests: {kind: top_terms, field: dest_ip, size: 3}
+
+  # Non-web, NON-routine ports where the proxy actually let the tunnel
+  # through. Denied or failed attempts were already stopped by policy and
+  # do not need an analyst; allowed ones are worth confirming.
+  unusual_port_allowed:
+    kind: terms
+    field: dest_port
+    size: 10
+    optional: true
+    filter:
+      all:
+        - {field: method, equals: CONNECT}
+        - {field: dest_port, in_param: unusual_ports}
+        - none: [{field: dest_port, in_param: routine_ports}]
+        - {field: outcome, equals: success}
     sub_aggs:
       clients: {kind: top_terms, field: client_ip, size: 3}
       dests: {kind: top_terms, field: dest_ip, size: 3}
+
+  # Scan-like use of a routine port: many distinct destinations from one
+  # client. Legitimate SSH reuses a handful of hosts.
+  routine_port_scanners:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    optional: true
+    filter:
+      all:
+        - {field: method, equals: CONNECT}
+        - {field: dest_port, in_param: routine_ports}
+    sub_aggs:
+      dests: {kind: cardinality, field: dest_ip}
+      failed: {kind: filter, filter: {field: outcome, equals: failure}}
+    transforms:
+      - classify_ip: {}
+      - min_count: {key: dests, value: $routine_port_scan_min}
 
   # Per-proxy-server breakdown. Grouped by the logical `proxy_instance`
   # field (e.g. squid's process name: squid-2, squid-4, squid-7 ...), so a
@@ -317,9 +383,13 @@ insights:
       {{ q.failing_destinations[0].key }} with
       {{ human_int(q.failing_destinations[0].count) }} failed attempts
       from {{ human_int(q.failing_destinations[0].clients) }}
-      client(s).{% endif %}
-      Sustained failure rates point at upstream link or DNS trouble on the
-      gateway rather than policy — see Gateway health.
+      client(s){%- if q.failing_destinations[0].ports %} on port
+      {{ q.failing_destinations[0].ports }}{% endif %}.{% endif %}
+      {%- if c.fail_rate >= params.fail_rate_warn %} At this rate the cause
+      is more likely the upstream link or DNS on the gateway than policy —
+      see Gateway health.
+      {%- else %} At this level failures are normal background (unreachable
+      peers, P2P and update targets), not a gateway fault.{% endif %}
 
   - when: "q.top_orgs"
     text: >
@@ -337,10 +407,12 @@ insights:
 
   - when: "q.unusual_port_traffic"
     text: >
-      Traffic to non-web ports was observed:
+      Tunnels to non-web ports were seen:
       {% for r in q.unusual_port_traffic[:4] %}port {{ r.key }}
-      ({{ human_int(r.count) }} requests){{ ", " if not loop.last }}
-      {%- endfor %}. Review the Unusual Destination Ports table.
+      ({{ human_int(r.count) }} requests, {{ human_int(r.allowed) }}
+      allowed){{ ", " if not loop.last }}
+      {%- endfor %}. Outbound SSH (22) is routine and not an incident on
+      its own; the Unusual Destination Ports table lists the sources.
 
   - when: "q.hourly"
     text: >
@@ -368,14 +440,25 @@ actions:
       {{ c.smb_traffic[0].clients }}). SMB to external addresses is
       classic worm/scanner behaviour — isolate and inspect these hosts.
 
-  - when: "q.unusual_port_traffic"
+  - when: "q.unusual_port_allowed"
     priority: P2
     owner: "SOC"
     text: >
-      Non-web destination ports were reached through the proxy
-      ({{ q.unusual_port_traffic | map(attribute='key') | join(', ') }}).
-      Confirm each is sanctioned; tunnels to such ports are a common
-      exfiltration / C2 pattern.
+      The proxy let tunnels through to non-web ports
+      {% for r in q.unusual_port_allowed[:4] %}{{ r.key }}
+      ({{ human_int(r.count) }}, from {{ r.clients }}){{ ", " if not loop.last }}
+      {%- endfor %}. Confirm they are sanctioned remote-access or admin use;
+      if not, tighten the proxy's allowed-ports policy for those ports.
+
+  - when: "q.routine_port_scanners"
+    priority: P3
+    owner: "SOC"
+    text: >
+      Client {{ q.routine_port_scanners[0].key }} opened SSH tunnels to
+      {{ human_int(q.routine_port_scanners[0].dests) }} distinct hosts
+      ({{ human_int(q.routine_port_scanners[0].failed) }} failed) — that is
+      scanning or brute-forcing, not administration. Identify the host
+      owner and the process.
 
   - when: "q.denied_destinations and q.denied_destinations[0].count >= 100"
     priority: P3
@@ -453,6 +536,19 @@ sections:
          pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
       - {key: count, label: "Requests", format: int}
       - {key: dests, label: "Destinations", format: int}
+      - {key: denied_pct, label: "Denied %", format: pct}
+      - {key: bytes, label: "Bandwidth", format: bytes}
+
+  - type: table
+    title: "Usage by campus location"
+    query: site_usage
+    hide_if_empty: true
+    note: "Only clients inside mapped campus address ranges carry a
+           location, so this is a subset of all traffic, not a total."
+    columns:
+      - {key: key, label: "Location", max: 30}
+      - {key: count, label: "Requests", format: int}
+      - {key: clients, label: "Clients", format: int}
       - {key: denied_pct, label: "Denied %", format: pct}
       - {key: bytes, label: "Bandwidth", format: bytes}
 
@@ -587,11 +683,14 @@ sections:
     title: "Unusual destination ports (non-web)"
     query: unusual_port_traffic
     hide_if_empty: true
-    note: "Tunnels to non-web ports through a browsing proxy deserve a
-           second look — common exfiltration / C2 pattern."
+    note: "CONNECT tunnels to non-web ports. Port 22 is routine outbound
+           SSH; the actionable rows are other ports the proxy let through
+           (the Allowed column). Denied or failed attempts were already
+           stopped by policy."
     columns:
       - {key: key, label: "Port"}
       - {key: count, label: "Requests", format: int}
+      - {key: allowed, label: "Allowed", format: int}
       - {key: clients, label: "Top clients", format: mono, max: 40}
       - {key: dests, label: "Top destinations", format: mono, max: 40}
 

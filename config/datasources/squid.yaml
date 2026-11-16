@@ -38,6 +38,11 @@ fields:
   # for the cloud-metadata (169.254.169.254) probe check.
   url: "url.original.keyword"
   dest_domain: "destination.domain.keyword"
+  # Client-side campus location enrichment from the engine's internal-IP map
+  # ("Hostel 04 - Wing 2 Right", "CIVIL"). Only clients inside mapped ranges
+  # carry it, so location tables describe that subset, not all traffic.
+  location: "source.geo.name.keyword"
+  site_zone: "source.site.zone.keyword"          # hostel | department | ...
   # proxy_host: "host.name"  # the client-facing VIP - not indexed here
 
 # host.name (the client-facing gateway VIP) is NOT indexed on this estate:
