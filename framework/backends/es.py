@@ -36,6 +36,8 @@ def ir_to_dsl(ir):
         _, field, patterns, ci = ir
         clauses = [{"wildcard": {field: {"value": p, "case_insensitive": ci}}}
                    for p in patterns]
+        if not clauses:
+            return {"match_none": {}}
         if len(clauses) == 1:
             return clauses[0]
         return {"bool": {"should": clauses, "minimum_should_match": 1}}
@@ -43,6 +45,8 @@ def ir_to_dsl(ir):
         _, field, prefixes, ci = ir
         clauses = [{"prefix": {field: {"value": p, "case_insensitive": ci}}}
                    for p in prefixes]
+        if not clauses:
+            return {"match_none": {}}
         if len(clauses) == 1:
             return clauses[0]
         return {"bool": {"should": clauses, "minimum_should_match": 1}}

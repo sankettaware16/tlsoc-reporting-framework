@@ -27,6 +27,9 @@ Leaf clauses (all take `field: <logical name>` unless noted):
     wildcard_param: <param>       patterns from a list param, used verbatim
     contains_param: <param>       list param terms wrapped as *term*
     suffix_param: <param>         list param suffixes wrapped as *suffix
+                                  (versioned: true also matches the suffix
+                                  followed by a cache-busting tail, e.g.
+                                  app.js@ver=1.2.3)
     prefix: "<p>" | [ps]          path prefix, case-insensitive by default
     prefix_param: <param>         prefixes from a list param
     range: {gte/gt/lte/lt: n}     numeric / date range
@@ -175,7 +178,12 @@ def _compile_node(node, ctx):
         terms = [f"*{t}*" for t in ctx.param(node["contains_param"])]
         return ("wildcard", field, terms, ci)
     if "suffix_param" in node:
-        terms = [f"*{t}" for t in ctx.param(node["suffix_param"])]
+        suffixes = ctx.param(node["suffix_param"])
+        terms = [f"*{t}" for t in suffixes]
+        if node.get("versioned"):
+            # Cache-busting leaves the suffix mid-path (app.js@ver=1.2.3 or
+            # app.js%3Fver=1.2.3), so a plain "*.js" never matches it.
+            terms += [f"*{t}{sep}*" for t in suffixes for sep in ("@", "%3f")]
         return ("wildcard", field, terms, ci)
     if "prefix" in node:
         return ("prefix", field, _as_list(node["prefix"]), ci)
