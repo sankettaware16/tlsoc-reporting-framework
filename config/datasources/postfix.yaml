@@ -20,6 +20,12 @@ fields:
   message_size: "email.size"
   dsn: "email.dsn.keyword"
   outcome: "event.outcome.keyword"
+  # Present only on single-line SMTP events (smtp_connect, smtp_disconnect,
+  # smtp_reject, auth_failure, tls_connection, warning ...). The correlated
+  # per-message records carry NO event.action - that absence is how the
+  # report tells a message from a protocol event.
+  event_action: "event.action.keyword"
+  reject_code: "event.code.keyword"             # "554 5.7.1", "450 4.1.8"
   client_ip: "source.ip"
   # smtp_host: "host.name"   # not indexed here - see note below
   sasl_user: "user.name.keyword"

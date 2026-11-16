@@ -1,48 +1,72 @@
 # ===========================================================================
 # REPORT: Daily Mail Flow & Security  (profile: mail -> postfix et al.)
+#
+# What is counted. The mail index mixes two kinds of record:
+#   * one correlated record per message delivery (sender, recipient, size,
+#     relay, final outcome sent / deferred / bounced)
+#   * single-line SMTP protocol events (connect, disconnect, TLS, reject,
+#     auth failure, warning), which outnumber deliveries several times over
+# Every "message" figure in this report counts DELIVERIES only. Refusals at
+# the SMTP stage and connections are reported separately and never mixed
+# into message totals or percentages.
 # ===========================================================================
 name: mail_daily
 slug: daily_mail          # output filename prefix: <slug>_<datasource>_<date>
 title: "Daily Mail Flow & Security Report"
 profile: mail
 description: >
-  Executive daily report for SMTP relay logs: volume, senders, recipients,
-  external destinations, relay usage, delivery outcomes and authentication.
+  Executive daily report for SMTP relay logs: delivered mail, senders,
+  recipients, external destinations, SMTP-stage refusals, delivery outcomes
+  and authentication.
 
 _defs:
+  # A delivery: the mail system accepted the message and attempted to hand
+  # it to the recipient (one record per recipient).
+  delivery: &delivery
+    {field: outcome, in: [sent, deferred, bounced]}
   failed_delivery: &failed_delivery
-    {field: outcome, in: [bounced, deferred, rejected, failed, error]}
-  # Mail addressed to a domain that is not one of the institute's own
+    {field: outcome, in: [bounced, deferred]}
+  # Refused during the SMTP conversation, before any message was accepted
+  # (block-listed client, unresolvable sender domain, SPF policy ...).
+  rejected: &rejected {field: event_action, equals: smtp_reject}
+  auth_failed: &auth_failed {field: event_action, equals: auth_failure}
+  # Delivery addressed to a domain that is not one of the institute's own
   # (own_domain_patterns). Empty patterns = the engine's flag alone.
   external_dest: &external_dest
     all:
+      - *delivery
       - {field: external_recipient, equals: true}
       - none: [{field: recipient_domain, wildcard_param: own_domain_patterns}]
-  # Transactions that died at the SMTP stage (spam / policy rejects, lost
-  # connections, failed auth): counted in the totals but never delivered.
-  smtp_failed: &smtp_failed {field: outcome, equals: failure}
 
 params:
   window_hours: 24
   top_n: 10
-  bounce_rate_warn: 2.0            # % failed deliveries -> amber badge
+  bounce_rate_warn: 2.0            # % of deliveries bounced/deferred -> amber
   bounce_rate_crit: 10.0
-  own_domain_patterns: []         # datasource lists the institute's domains
+  prev_window_min_ratio: 0.5
+  own_domain_patterns: []          # datasource lists the institute's domains
   # An account is only suspicious when its submissions come from this many
   # UNRELATED networks (ASNs). Many IPs inside one provider is normal: Gmail
   # "send mail as" uses dozens of Google addresses, mobile carriers rotate.
   sasl_networks_min: 3
-  prev_window_min_ratio: 0.5
+  # Failed SMTP logins from ONE address before it is worth an action. A
+  # user with a stale password on a phone produces a few dozen a day.
+  auth_fail_source_min: 200
 
 queries:
-  total_emails: {kind: count}
-  total_volume: {kind: sum, field: message_size, optional: true}
-  unique_senders: {kind: cardinality, field: sender}
-  unique_recipients: {kind: cardinality, field: recipient}
+  total_emails: {kind: count, filter: *delivery}
+  total_volume: {kind: sum, field: message_size, optional: true,
+                 filter: *delivery}
+  unique_senders: {kind: cardinality, field: sender, filter: *delivery}
+  unique_recipients: {kind: cardinality, field: recipient, filter: *delivery}
+  sent_total: {kind: count, filter: {field: outcome, equals: sent}}
+  deferred_total: {kind: count, filter: {field: outcome, equals: deferred}}
+  bounced_total: {kind: count, filter: {field: outcome, equals: bounced}}
 
   hourly:
     kind: date_histogram
     interval: hour
+    filter: *delivery
     sub_aggs:
       senders: {kind: cardinality, field: sender}
 
@@ -50,12 +74,13 @@ queries:
     kind: terms
     field: sender
     size: $top_n
+    filter: *delivery
     sub_aggs:
       volume: {kind: sum, field: message_size}
       recipients: {kind: cardinality, field: recipient}
-      rejected: {kind: filter, filter: *smtp_failed}
 
-  top_recipients: {kind: terms, field: recipient, size: $top_n}
+  top_recipients: {kind: terms, field: recipient, size: $top_n,
+                   filter: *delivery}
 
   external_domains:
     kind: terms
@@ -64,19 +89,22 @@ queries:
     optional: true
     filter: *external_dest
 
+  external_mail_total: {kind: count, optional: true, filter: *external_dest}
+
   relay_hosts:
     kind: terms
     field: relay_host
     size: $top_n
     optional: true
+    filter: *delivery
 
   smtp_hosts:
     kind: terms
     field: smtp_host
     size: $top_n
     optional: true
+    filter: *delivery
 
-  outcomes: {kind: terms, field: outcome, size: 10, optional: true}
   failed_total: {kind: count, filter: *failed_delivery, optional: true}
 
   failed_senders:
@@ -88,10 +116,52 @@ queries:
     sub_aggs:
       dsn: {kind: top_terms, field: dsn, size: 2}
 
+  # -- refused at the SMTP stage ------------------------------------------
+  rejected_total: {kind: count, optional: true, filter: *rejected}
+
+  hourly_rejected:
+    kind: date_histogram
+    interval: hour
+    optional: true
+    filter: *rejected
+
+  rejected_codes:
+    kind: terms
+    field: reject_code
+    size: 8
+    optional: true
+    filter: *rejected
+
+  rejected_senders:
+    kind: terms
+    field: sender
+    size: $top_n
+    optional: true
+    filter: *rejected
+    sub_aggs:
+      recipients: {kind: cardinality, field: recipient}
+      sources: {kind: cardinality, field: client_ip}
+      code: {kind: top_terms, field: reject_code, size: 1}
+
+  rejected_sources:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    optional: true
+    filter: *rejected
+    sub_aggs:
+      country: {kind: top_terms, field: geo_country, size: 1}
+      network: {kind: top_terms, field: asn_org, size: 1}
+      code: {kind: top_terms, field: reject_code, size: 1}
+    transforms:
+      - classify_ip: {}
+
+  # -- submission sources and authentication --------------------------------
   source_ips:
     kind: terms
     field: client_ip
     size: $top_n
+    filter: *delivery
     sub_aggs:
       country: {kind: top_terms, field: geo_country, size: 1}
       users: {kind: cardinality, field: sasl_user}
@@ -104,46 +174,64 @@ queries:
     size: $top_n
     missing: "Unresolved"
     optional: true
+    filter: *delivery
 
   sasl_users:
     kind: terms
     field: sasl_user
     size: $top_n
     optional: true
+    filter: *delivery
     sub_aggs:
       ips: {kind: cardinality, field: client_ip}
       top_ip: {kind: top_terms, field: client_ip, size: 1}
-
-  external_mail_total:
-    kind: count
-    optional: true
-    filter: *external_dest
-
-  smtp_failed_total: {kind: count, optional: true, filter: *smtp_failed}
 
   # Accounts submitting from several unrelated networks (see
   # sasl_networks_min): the credible compromised-mailbox signal.
   sasl_roaming:
     kind: terms
     field: sasl_user
-    size: $top_n
+    size: 200
     optional: true
+    filter: *delivery
     sub_aggs:
       networks: {kind: cardinality, field: asn_org}
       ips: {kind: cardinality, field: client_ip}
-      top_ip: {kind: top_terms, field: client_ip, size: 1}
       orgs: {kind: top_terms, field: asn_org, size: 3}
     transforms:
       - min_count: {key: networks, value: $sasl_networks_min}
       - sort: {key: networks}
+      - limit: {size: $top_n}
 
-  prev_total: {kind: count, window: previous}
+  auth_fail_total: {kind: count, optional: true, filter: *auth_failed}
+
+  # Failed SMTP logins by source. The log does not record WHICH account was
+  # tried, so this can only point at addresses, not at targeted users.
+  auth_fail_sources:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    optional: true
+    filter: *auth_failed
+    sub_aggs:
+      country: {kind: top_terms, field: geo_country, size: 1}
+      network: {kind: top_terms, field: asn_org, size: 1}
+    transforms:
+      - classify_ip: {}
+
+  prev_total: {kind: count, window: previous, filter: *delivery}
 
 computed:
   - {name: total, expr: "q.total_emails or 0"}
   - {name: failed, expr: "q.failed_total or 0"}
   - {name: failure_rate, expr: "pct(c.failed, c.total)"}
   - {name: external_share, expr: "pct(q.external_mail_total or 0, c.total)"}
+  - {name: rejected, expr: "q.rejected_total or 0"}
+  - {name: rejected_share, expr: "pct(c.rejected, c.rejected + c.total)"}
+  - name: outcome_rows
+    expr: "[{'key': 'Delivered', 'count': q.sent_total or 0},
+            {'key': 'Deferred (will retry)', 'count': q.deferred_total or 0},
+            {'key': 'Bounced', 'count': q.bounced_total or 0}]"
   - name: prev_reliable
     expr: "(q.prev_total or 0) >= c.total * params.prev_window_min_ratio
            and (q.prev_total or 0) > 0"
@@ -152,7 +240,7 @@ computed:
   - name: data_warning
     expr: "None if c.prev_reliable or c.total == 0 else
            'Previous window logged only ' ~ human_int(q.prev_total) ~
-           ' messages against ' ~ human_int(c.total) ~ ' now — trend
+           ' deliveries against ' ~ human_int(c.total) ~ ' now — trend
            comparison suppressed (likely ingest gap).'"
 
 badges:
@@ -166,85 +254,98 @@ badges:
       - {text: HEALTHY, color: green}
 
 insights:
-  - when: "c.total == 0"
+  - when: "c.total == 0 and c.rejected == 0"
     stop: true
     text: >
       No mail traffic was recorded in the reporting window. Verify the log
       pipeline and that {{ ds.index }} is receiving documents.
 
   - text: >
-      {{ human_int(c.total) }} messages processed from
-      {{ human_int(q.unique_senders) }} distinct senders to
-      {{ human_int(q.unique_recipients) }} distinct recipients
-      {%- if q.total_volume %} ({{ human_bytes(q.total_volume) }} total
-      volume){% endif %}
+      The mail system accepted {{ human_int(c.total) }} message deliveries
+      (one per recipient) from {{ human_int(q.unique_senders) }} distinct
+      senders to {{ human_int(q.unique_recipients) }} distinct recipients
+      {%- if q.total_volume %} ({{ human_bytes(q.total_volume) }}){% endif %}
       {%- if c.delta_emails is not none %}
       ({{ "▲" if c.delta_emails > 0 else "▼" }}
       {{ "%.1f" | format(c.delta_emails | abs) }}% vs previous
-      {{ window.hours }}h){% endif %}.
+      {{ window.hours }}h){% endif %}:
+      {{ human_int(q.sent_total or 0) }} delivered,
+      {{ human_int(q.deferred_total or 0) }} deferred and
+      {{ human_int(q.bounced_total or 0) }} bounced.
+
+  - when: "c.rejected > 0"
+    text: >
+      A further {{ human_int(c.rejected) }} delivery attempts were refused
+      during the SMTP conversation and never entered the mail system —
+      {{ "%.0f" | format(c.rejected_share) }}% of everything offered to the
+      gateways.
+      {%- if q.rejected_codes %} The commonest refusal was
+      {{ q.rejected_codes[0].key }}
+      ({{ human_int(q.rejected_codes[0].count) }}){% endif %}
+      {%- if q.rejected_senders %}; the most-refused sender address was
+      {{ q.rejected_senders[0].key }}
+      ({{ human_int(q.rejected_senders[0].count) }} attempts){% endif %}.
+      Refused mail is not included in any message figure in this report.
 
   - when: "q.top_senders"
     text: >
-      {{ q.top_senders[0].key }} generated
-      {{ "%.1f" | format(pct(q.top_senders[0].count, c.total)) }}% of total
-      mail traffic ({{ human_int(q.top_senders[0].count) }} messages to
-      {{ human_int(q.top_senders[0].recipients) }} distinct recipients
-      {%- if q.top_senders[0].rejected %}; {{ human_int(q.top_senders[0].rejected) }}
-      of them failed at the SMTP stage and were never delivered{% endif %}).
-
-  - when: "(q.smtp_failed_total or 0) > 0"
-    text: >
-      {{ human_int(q.smtp_failed_total) }}
-      ({{ "%.1f" | format(pct(q.smtp_failed_total, c.total)) }}%) of the
-      messages above failed at the SMTP stage — spam and policy rejects,
-      lost connections, failed authentication — and were never delivered.
-      Delivery failures below count only messages that were accepted and
-      then bounced or deferred.
+      The largest sender of delivered mail was {{ q.top_senders[0].key }}
+      with {{ human_int(q.top_senders[0].count) }} deliveries
+      ({{ "%.1f" | format(pct(q.top_senders[0].count, c.total)) }}% of the
+      total) to {{ human_int(q.top_senders[0].recipients) }} distinct
+      recipients.
 
   - when: "q.external_domains"
     text: >
-      {{ "%.1f" | format(c.external_share) }}% of messages were addressed
-      outside the institute's own domains; the most contacted external
-      domain was
+      {{ human_int(q.external_mail_total) }} deliveries
+      ({{ "%.1f" | format(c.external_share) }}%) were addressed outside
+      the institute's own domains; the most contacted external domain was
       {{ q.external_domains[0].key }} with
-      {{ human_int(q.external_domains[0].count) }} deliveries.
+      {{ human_int(q.external_domains[0].count) }}.
 
   - when: "q.relay_hosts"
     text: >
       Relay {{ q.relay_hosts[0].key }} carried
       {{ "%.1f" | format(pct(q.relay_hosts[0].count, c.total)) }}% of
-      traffic.
+      deliveries.
 
   - when: "c.failed > 0"
     text: >
-      {{ human_int(c.failed) }} deliveries failed
-      ({{ "%.2f" | format(c.failure_rate) }}%): accepted, then bounced or
-      deferred. The senders behind the failures are listed under Delivery
+      {{ human_int(c.failed) }} deliveries
+      ({{ "%.2f" | format(c.failure_rate) }}%) were deferred or bounced
+      after acceptance. The senders behind them are listed under Delivery
       Outcomes.
 
   - when: "q.hourly"
     text: >
       {% set peak = q.hourly | max(attribute='count') %}
-      Peak mail activity was around {{ peak.label }}
-      {{ window.tz_label }} with {{ human_int(peak.count) }} messages in
-      the hour.
+      Deliveries peaked around {{ peak.label }} {{ window.tz_label }} with
+      {{ human_int(peak.count) }} in the hour.
 
   - when: "q.sasl_users"
     text: >
-      {{ q.sasl_users | length }} authenticated (SASL) accounts submitted
-      mail; the most active was {{ q.sasl_users[0].key }} with
-      {{ human_int(q.sasl_users[0].count) }} messages from
+      Among authenticated (SASL) accounts the most active was
+      {{ q.sasl_users[0].key }} with
+      {{ human_int(q.sasl_users[0].count) }} deliveries from
       {{ human_int(q.sasl_users[0].ips) }} source IP(s).
+
+  - when: "(q.auth_fail_total or 0) > 0 and q.auth_fail_sources"
+    text: >
+      {{ human_int(q.auth_fail_total) }} SMTP login attempts failed; the
+      busiest source was {{ q.auth_fail_sources[0].key }}
+      ({{ q.auth_fail_sources[0].location }}) with
+      {{ human_int(q.auth_fail_sources[0].count) }}. The log does not
+      record which account was tried.
 
 actions:
   - when: "c.failure_rate >= params.bounce_rate_warn"
     priority: P2
     owner: "Mail team"
     text: >
-      Delivery failure rate is {{ "%.2f" | format(c.failure_rate) }}%
-      ({{ human_int(c.failed) }} messages). Review the failed-sender table
-      and the relay queues; sustained deferrals often mean an upstream
-      block-list entry.
+      {{ "%.2f" | format(c.failure_rate) }}% of accepted deliveries
+      ({{ human_int(c.failed) }}) were deferred or bounced. Review the
+      failed-sender table and the relay queues; sustained deferrals often
+      mean an upstream block-list entry.
 
   - when: "q.sasl_roaming"
     priority: P2
@@ -256,14 +357,26 @@ actions:
       matches expected usage (a traveller, or a compromised mailbox being
       used from several places).
 
+  - when: "q.auth_fail_sources and
+           q.auth_fail_sources[0].count >= params.auth_fail_source_min"
+    priority: P3
+    owner: "SOC"
+    text: >
+      {{ q.auth_fail_sources[0].key }}
+      ({{ q.auth_fail_sources[0].location }}) failed SMTP login
+      {{ human_int(q.auth_fail_sources[0].count) }} times. A user with a
+      stale password produces a few dozen a day; this many from one
+      address is password guessing or a broken client. Block the address
+      at the submission servers if it is not a known user.
+
   - when: "q.top_senders and pct(q.top_senders[0].count, c.total) > 40"
     priority: P3
     owner: "Mail team"
     text: >
-      A single sender ({{ q.top_senders[0].key }}) generated
+      A single sender ({{ q.top_senders[0].key }}) accounts for
       {{ "%.1f" | format(pct(q.top_senders[0].count, c.total)) }}% of all
-      mail. If this is not a known bulk sender, check for a runaway job or
-      abuse.
+      delivered mail. If this is not a known bulk sender, check for a
+      runaway job or abuse.
 
 sections:
   - {type: heading, title: "Executive summary"}
@@ -271,32 +384,34 @@ sections:
 
   - type: kpi_row
     items:
-      - {label: "Messages", value: "c.total", format: int,
+      - {label: "Deliveries", value: "c.total", format: int,
          delta: "c.delta_emails"}
       - {label: "Distinct senders", value: "q.unique_senders", format: int}
       - {label: "Distinct recipients", value: "q.unique_recipients",
          format: int}
-      - {label: "Delivery failures", value: "c.failed", format: int,
+      - {label: "Deferred / bounced", value: "c.failed", format: int,
          style: "'crit' if c.failure_rate >= params.bounce_rate_crit else
                  ('warn' if c.failure_rate >= params.bounce_rate_warn
                  else 'ok')",
-         foot: "{{ '%.2f' | format(c.failure_rate) }}% of traffic"}
+         foot: "{{ '%.2f' | format(c.failure_rate) }}% of deliveries"}
+      - {label: "Refused at SMTP", value: "c.rejected", format: int,
+         foot: "not counted as deliveries"}
 
   - {type: heading, title: "Mail flow"}
   - type: timeseries
-    title: "Messages per hour"
+    title: "Deliveries per hour"
     query: hourly
-    series_label: "messages / hour"
+    series_label: "deliveries / hour"
 
   - type: row
     left:
       type: bars
-      title: "Top senders"
+      title: "Top senders (delivered mail)"
       query: top_senders
       color: navy
     right:
       type: bars
-      title: "Top recipients"
+      title: "Top recipients (delivered mail)"
       query: top_recipients
       color: teal
 
@@ -305,9 +420,8 @@ sections:
     query: top_senders
     columns:
       - {key: key, label: "Sender", max: 44}
-      - {key: count, label: "Messages", format: int}
+      - {key: count, label: "Deliveries", format: int}
       - {key: recipients, label: "Recipients", format: int}
-      - {key: rejected, label: "Failed at SMTP", format: int}
       - {key: volume, label: "Volume", format: bytes}
 
   - type: row
@@ -326,8 +440,8 @@ sections:
   - type: row
     left:
       type: bars
-      title: "Outcome breakdown"
-      query: outcomes
+      title: "Outcome of accepted deliveries"
+      rows: "c.outcome_rows"
       color: green
       show_pct: true
     right:
@@ -337,7 +451,7 @@ sections:
       color: navy
 
   - type: table
-    title: "Senders with failed deliveries"
+    title: "Senders with deferred or bounced deliveries"
     query: failed_senders
     hide_if_empty: true
     columns:
@@ -345,27 +459,66 @@ sections:
       - {key: count, label: "Failures", format: int}
       - {key: dsn, label: "DSN codes"}
 
+  - {type: heading, title: "Refused at the SMTP stage"}
+  - type: timeseries
+    title: "Refusals per hour"
+    query: hourly_rejected
+    series_label: "refused delivery attempts / hour"
+
+  - type: table
+    title: "Refusals by SMTP reply code"
+    query: rejected_codes
+    hide_if_empty: true
+    note: "450 4.1.8 = sender's domain does not exist (typical of forged
+           spam); 554 5.7.1 = sending host is on a block list;
+           550 5.7.23 / 5.7.24 = SPF policy (analysed in the mail-gateway SPF
+           report). These attempts were stopped before a message was
+           accepted — the filtering is working."
+    columns:
+      - {key: key, label: "Reply code", format: mono}
+      - {key: count, label: "Refusals", format: int}
+
+  - type: table
+    title: "Most-refused sender addresses"
+    query: rejected_senders
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Claimed sender", max: 40}
+      - {key: count, label: "Refusals", format: int}
+      - {key: recipients, label: "Recipients tried", format: int}
+      - {key: sources, label: "Source IPs", format: int}
+      - {key: code, label: "Reply code", format: mono}
+
+  - type: table
+    title: "Most-refused source addresses"
+    query: rejected_sources
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
+      - {key: location, label: "Location", max: 22}
+      - {key: network, label: "Network", max: 28}
+      - {key: count, label: "Refusals", format: int}
+      - {key: code, label: "Reply code", format: mono}
+
   - {type: heading, title: "Submission sources & authentication"}
   - type: table
-    title: "Source IPs"
+    title: "Source IPs of delivered mail"
     query: source_ips
     columns:
       - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
       - {key: scope, label: "Class", format: pill,
          pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
       - {key: location, label: "Location", max: 22}
-      - {key: count, label: "Messages", format: int}
+      - {key: count, label: "Deliveries", format: int}
       - {key: users, label: "SASL users", format: int}
 
   - type: table
     title: "Authenticated (SASL) submitters"
     query: sasl_users
     hide_if_empty: true
-    note: "An account submitting from many IPs, or from EXTERNAL space,
-           is the classic compromised-mailbox signature."
     columns:
       - {key: key, label: "Account", format: mono}
-      - {key: count, label: "Messages", format: int}
+      - {key: count, label: "Deliveries", format: int}
       - {key: ips, label: "Distinct IPs", format: int}
       - {key: top_ip, label: "Top source", format: mono, width: 104, nowrap: true}
 
@@ -383,8 +536,22 @@ sections:
       - {key: ips, label: "Distinct IPs", format: int}
       - {key: orgs, label: "Top networks", max: 40}
 
+  - type: table
+    title: "Failed SMTP logins by source"
+    query: auth_fail_sources
+    hide_if_empty: true
+    note: "The log records the source of a failed login but not the
+           account tried, so this lists addresses only."
+    columns:
+      - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: location, label: "Location", max: 22}
+      - {key: network, label: "Network", max: 28}
+      - {key: count, label: "Failed logins", format: int}
+
   - type: bars
-    title: "Source countries"
+    title: "Source countries of delivered mail"
     query: countries
     color: teal
 
