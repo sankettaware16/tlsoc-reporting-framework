@@ -208,7 +208,7 @@ queries:
   routine_port_scanners:
     kind: terms
     field: client_ip
-    size: $top_n
+    size: 500           # judged on destination spread, not on volume
     optional: true
     filter:
       all:
@@ -220,6 +220,8 @@ queries:
     transforms:
       - classify_ip: {}
       - min_count: {key: dests, value: $routine_port_scan_min}
+      - sort: {key: dests}
+      - limit: {size: $top_n}
 
   # Per-proxy-server breakdown. Grouped by the logical `proxy_instance`
   # field (e.g. squid's process name: squid-2, squid-4, squid-7 ...), so a
@@ -267,6 +269,7 @@ queries:
     sub_aggs:
       ports: {kind: top_terms, field: dest_port, size: 3}
       clients: {kind: top_terms, field: client_ip, size: 2}
+      client_count: {kind: cardinality, field: client_ip}
 
   # Requests for the link-local cloud metadata service (169.254.169.254)
   # seen at the egress proxy. That address should never be reachable this
@@ -465,11 +468,13 @@ actions:
     owner: "SOC"
     text: >
       Destination {{ q.denied_destinations[0].key }} (ports
-      {{ q.denied_destinations[0].ports }}) collected
-      {{ human_int(q.denied_destinations[0].count) }} denials, mostly from
-      {{ q.denied_destinations[0].clients }} — an automated retry loop.
-      Identify what is running on the client(s) and why it insists on
-      that destination.
+      {{ q.denied_destinations[0].ports }}) was denied
+      {{ human_int(q.denied_destinations[0].count) }} times for
+      {{ human_int(q.denied_destinations[0].client_count) }} client(s);
+      the two busiest were {{ q.denied_destinations[0].clients }}. Requests
+      repeated at this rate are software retrying automatically, not people
+      browsing. Identify the application on those clients; if it is
+      legitimate, either allow the destination or stop the application.
 
   - when: "q.failed_total is not none
            and c.fail_rate >= params.fail_rate_warn"

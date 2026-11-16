@@ -166,7 +166,7 @@ queries:
   dga_suspects:
     kind: terms
     field: client_ip
-    size: $top_n
+    size: 200           # judged on name spread, so look past the busiest 10
     filter:
       all:
         - *nxdomain
@@ -179,6 +179,7 @@ queries:
       - classify_ip: {}
       - min_count: {value: $nxdomain_client_min}
       - min_count: {key: domains, value: $dga_names_min}
+      - limit: {size: $top_n}
 
   refused_clients:
     kind: terms
@@ -197,7 +198,7 @@ queries:
   tunnel_suspects:
     kind: terms
     field: client_ip
-    size: 10
+    size: 100
     filter:
       all:
         - {field: dns_event, equals: query}
@@ -212,7 +213,7 @@ queries:
     transforms:
       - classify_ip: {}
       - min_count: {value: $tunnel_client_min}
-      - min_count: {key: domains, value: $tunnel_names_min}
+      - limit: {size: $top_n}
 
   # Per-resolver-node breakdown (host.name: pdns4, ...). One node today;
   # the section is ready for the fleet and collapses to one row meanwhile.
@@ -279,6 +280,12 @@ queries:
   prev_total: {kind: count, window: previous, filter: *query_side}
 
 computed:
+  # Heavy TXT/NULL/ANY clients whose queries are ALSO spread over many
+  # distinct names - the tunneling shape. The table lists every heavy
+  # client; only these raise the insight and the action.
+  - name: tunnel_shaped
+    expr: "(q.tunnel_suspects or [])
+           | selectattr('domains', 'ge', params.tunnel_names_min) | list"
   # Clients with NXDOMAIN volume but too few distinct names for a DGA:
   # repeated lookups of the same missing name (stale configuration).
   - name: stale_nx
@@ -380,11 +387,12 @@ insights:
 
   - when: "c.stale_nx"
     text: >
-      {{ c.stale_nx | length }} client(s) repeated lookups of a few
-      non-existent names thousands of times (the top one,
-      {{ c.stale_nx[0].key }}, asked for {{ c.stale_nx[0].examples }}
-      {{ human_int(c.stale_nx[0].count) }} times) — stale or mistyped
-      configuration, not malware.
+      {{ c.stale_nx | length }} client(s) each collected thousands of
+      NXDOMAIN answers for only a handful of names (the top one,
+      {{ c.stale_nx[0].key }}: {{ human_int(c.stale_nx[0].count) }} answers
+      for {{ human_int(c.stale_nx[0].domains) }} name(s), e.g.
+      {{ c.stale_nx[0].examples }}) — a client retrying the same missing
+      names, not malware.
 
   - when: "c.servfail > 0 and q.servfail_domains"
     text: >
@@ -393,9 +401,9 @@ insights:
       ({{ human_int(q.servfail_domains[0].count) }} failures affecting
       {{ human_int(q.servfail_domains[0].clients) }} clients).
 
-  - when: "q.tunnel_suspects"
+  - when: "c.tunnel_shaped"
     text: >
-      {{ q.tunnel_suspects | length }} client(s) sent heavy
+      {{ c.tunnel_shaped | length }} client(s) sent heavy
       {{ params.tunnel_qtypes | join('/') }} volume spread over hundreds of
       distinct names. That is the shape of DNS tunneling, but also of some
       security products and mail filters — see the example names under
@@ -449,32 +457,33 @@ actions:
       {{ human_int(q.dga_suspects[0].count) }} NXDOMAIN answers across
       {{ human_int(q.dga_suspects[0].domains) }} distinct names
       (e.g. {{ q.dga_suspects[0].examples }}). Many different names that
-      do not exist is the DGA-malware pattern (a dynamic-DNS parent domain
-      such as duckdns.org makes it more suspicious) — identify the process
-      behind the lookups.
+      do not exist is the pattern of malware that generates domains, and
+      also of some VPN and proxy tools. Look at the names: if they are
+      random-looking or sit under a dynamic-DNS provider, identify the
+      process behind the lookups on that host.
 
   - when: "c.stale_nx"
     priority: P4
     owner: "Network team"
     text: >
-      {{ c.stale_nx[0].key }} ({{ c.stale_nx[0].site }}) retried
-      {{ c.stale_nx[0].examples }} {{ human_int(c.stale_nx[0].count) }}
-      times and always got NXDOMAIN. Only
-      {{ human_int(c.stale_nx[0].domains) }} distinct name(s), so this is a
-      stale setting or a discovery/update client retrying one target, not
-      malware — fix or silence the client to stop the retry loop.
-      {%- if c.stale_nx | length > 1 %} {{ c.stale_nx | length - 1 }} more
-      client(s) behave the same; see the NXDOMAIN table.{% endif %}
+      {{ c.stale_nx[0].key }} ({{ c.stale_nx[0].site }}) collected
+      {{ human_int(c.stale_nx[0].count) }} NXDOMAIN answers for only
+      {{ human_int(c.stale_nx[0].domains) }} distinct name(s), e.g.
+      {{ c.stale_nx[0].examples }}. A client repeating the same missing
+      names is a stale setting or a discovery service that cannot find its
+      target, not malware; fixing the client removes needless resolver
+      load.{%- if c.stale_nx | length > 1 %} {{ c.stale_nx | length - 1 }}
+      more client(s) behave the same; see the NXDOMAIN table.{% endif %}
 
-  - when: "q.tunnel_suspects"
+  - when: "c.tunnel_shaped"
     priority: P2
     owner: "SOC"
     text: >
-      {{ q.tunnel_suspects | map(attribute='key') | join(', ') }}
+      {{ c.tunnel_shaped | map(attribute='key') | join(', ') }}
       exceeded {{ human_int(params.tunnel_client_min) }}
       {{ params.tunnel_qtypes | join('/') }} queries in
       {{ window.hours }}h across {{ human_int(params.tunnel_names_min) }}+
-      distinct names (e.g. {{ q.tunnel_suspects[0].examples }}). Check the
+      distinct names (e.g. {{ c.tunnel_shaped[0].examples }}). Check the
       names: a vendor or mail-filter lookup domain is benign (add it to
       tunnel_ignore_suffixes); random-looking subdomains of one parent
       domain are DNS tunneling — inspect the querying process.
@@ -694,15 +703,15 @@ sections:
       - {key: examples, label: "Example names", format: mono, max: 34}
 
   - type: table
-    title: "Possible DNS tunneling (heavy TXT/NULL/ANY volume)"
+    title: "Clients with heavy TXT/NULL/ANY query volume"
     query: tunnel_suspects
     hide_if_empty: true
-    note: "Tunneling tools (iodine, dnscat2, ...) move data in
-           payload-carrying query types, one fresh name per message.
-           Listed only when the volume is high AND spread over many
-           distinct names; resolver diagnostics (hostname.bind) and known
-           vendor domains are excluded. Read the example names to tell a
-           security product from a tunnel."
+    note: "Every client above the volume threshold is listed (resolver
+           diagnostics and known vendor domains excluded). Tunneling tools
+           put each message in a fresh name, so a tunnel shows hundreds of
+           distinct names; a client repeating a few names is doing
+           something else (lookups by a script, mail checks) and is listed
+           for information only."
     columns:
       - {key: key, label: "Client IP", format: mono, width: 110, nowrap: true}
       - {key: scope, label: "Class", format: pill,
