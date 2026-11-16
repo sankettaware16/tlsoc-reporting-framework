@@ -199,6 +199,13 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 - Terms queries larger than 20 buckets with sub-aggregations use
   breadth-first collection: Elasticsearch 8.19 returned wrong cardinality
   values for some buckets otherwise.
+- Checked against every retained day rather than one: the DNS
+  generated-domain action now needs hundreds of names each asked a few
+  times (hosts repeating a few names are reported as retry loops, with
+  their share of resolver load); the web health badge follows server
+  errors (5xx) instead of 4xx from scanners; the proxy denial threshold
+  sits above the everyday level; the mail multi-network action also needs
+  more than one country.
 - dns: every heavy TXT/NULL/ANY client is listed (only the tunneling shape
   raises an action); DGA and SSH-scan checks look past the ten busiest
   clients; counts are no longer attributed to example names.

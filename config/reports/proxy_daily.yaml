@@ -23,7 +23,9 @@ _defs:
 params:
   window_hours: 24
   top_n: 10
-  denied_rate_warn: 2.0
+  # Share of requests denied by policy before the badge and the action
+  # turn. The observed everyday level is 2-3%, so amber starts above it.
+  denied_rate_warn: 5.0
   denied_rate_crit: 10.0
   # Upstream connection-failure thresholds for the gateway-health badge.
   fail_rate_warn: 5.0

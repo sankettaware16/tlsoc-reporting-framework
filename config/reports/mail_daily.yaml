@@ -46,9 +46,11 @@ params:
   prev_window_min_ratio: 0.5
   own_domain_patterns: []          # datasource lists the institute's domains
   # An account is only suspicious when its submissions come from this many
-  # UNRELATED networks (ASNs). Many IPs inside one provider is normal: Gmail
-  # "send mail as" uses dozens of Google addresses, mobile carriers rotate.
+  # UNRELATED networks (ASNs) AND from more than one country. Many IPs
+  # inside one provider is normal (Gmail "send mail as", mobile carriers),
+  # and so is one person on a phone, home broadband and a second carrier.
   sasl_networks_min: 3
+  sasl_countries_min: 2
   # Failed SMTP logins from ONE address before it is worth an action. A
   # user with a stale password on a phone produces a few dozen a day.
   auth_fail_source_min: 200
@@ -196,10 +198,13 @@ queries:
     filter: *delivery
     sub_aggs:
       networks: {kind: cardinality, field: asn_org}
+      countries: {kind: cardinality, field: geo_country}
       ips: {kind: cardinality, field: client_ip}
       orgs: {kind: top_terms, field: asn_org, size: 3}
+      where: {kind: top_terms, field: geo_country, size: 3}
     transforms:
       - min_count: {key: networks, value: $sasl_networks_min}
+      - min_count: {key: countries, value: $sasl_countries_min}
       - sort: {key: networks}
       - limit: {size: $top_n}
 
@@ -352,8 +357,9 @@ actions:
     owner: "SOC"
     text: >
       Account {{ q.sasl_roaming[0].key }} submitted mail from
-      {{ human_int(q.sasl_roaming[0].networks) }} unrelated networks
-      ({{ q.sasl_roaming[0].orgs }}) in {{ window.hours }}h — verify this
+      {{ human_int(q.sasl_roaming[0].networks) }} unrelated networks in
+      {{ human_int(q.sasl_roaming[0].countries) }} countries
+      ({{ q.sasl_roaming[0].where }}) in {{ window.hours }}h — verify this
       matches expected usage (a traveller, or a compromised mailbox being
       used from several places).
 
@@ -523,7 +529,7 @@ sections:
       - {key: top_ip, label: "Top source", format: mono, width: 104, nowrap: true}
 
   - type: table
-    title: "Accounts submitting from several networks"
+    title: "Accounts submitting from several networks and countries"
     query: sasl_roaming
     hide_if_empty: true
     note: "Counts unrelated networks (ASNs), not IPs: dozens of Google
@@ -533,8 +539,9 @@ sections:
     columns:
       - {key: key, label: "Account", format: mono}
       - {key: networks, label: "Networks", format: int}
+      - {key: where, label: "Countries", max: 30}
       - {key: ips, label: "Distinct IPs", format: int}
-      - {key: orgs, label: "Top networks", max: 40}
+      - {key: orgs, label: "Top networks", max: 34}
 
   - type: table
     title: "Failed SMTP logins by source"
