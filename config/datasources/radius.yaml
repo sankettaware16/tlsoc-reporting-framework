@@ -1,0 +1,57 @@
+# ===========================================================================
+# Datasource: FreeRADIUS - Wi-Fi / 802.1X authentication (parsed by
+# foss-soc-engine, observer.source_program: radius).
+#
+# One index family carries several document shapes, told apart by
+# event.action:
+#   radius_login              one per authentication log line. event.outcome
+#                             is success|failure; failures carry the reason in
+#                             error.message. NOTE the log is chatty on failure:
+#                             a rejected MS-CHAPv2 login is followed by a
+#                             second "session previously rejected (again)"
+#                             line, and a failed proxied login by two
+#                             near-identical "Home Server ..." lines. The
+#                             report de-duplicates these (see radius_daily).
+#   proxy_request_failed      a request forwarded to the upstream (federation)
+#                             RADIUS server got no answer; destination.* is
+#                             the upstream, port 1812 = authentication,
+#                             1813 = accounting
+#   home_server_alive / _zombie / status_check_*   upstream liveness
+#   subsystem_message / daemon_message             EAP/TLS and daemon notices
+#   fticks                    eduroam F-Ticks statistics (own realm only)
+#
+# Identity facts that shape the report:
+#   * source.ip is the NAS (wireless controller / AP), NOT the client.
+#   * the client device is radius.calling_station_id (its MAC address, in a
+#     mix of formats - bare, dash- and colon-separated - and usually a
+#     per-network randomised address, so "devices" is an upper bound).
+#   * there is no realm field: the realm is the text after the "@" in
+#     user.name.
+# ===========================================================================
+name: radius
+label: "Wi-Fi / 802.1X Authentication (FreeRADIUS)"
+profile: wifi_auth
+index: "fosstlsoc-logs-radius*"
+
+fields:
+  timestamp: "@timestamp"
+  event_action: "event.action.keyword"
+  outcome: "event.outcome.keyword"
+  error_message: "error.message.keyword"        # failure reason (login lines)
+  user: "user.name.keyword"                     # identity as typed, incl. realm
+  client_mac: "radius.calling_station_id.keyword"
+  nas_ip: "source.ip"                           # wireless controller / AP
+  server: "host.name.keyword"                   # the FreeRADIUS node (rad1, ...)
+  # Upstream (federation) RADIUS server, on proxy / liveness lines only.
+  upstream_ip: "destination.ip"
+  upstream_port: "destination.port"
+  upstream_org: "destination.as.organization.name.keyword"
+  # Daemon notices ("Marking home server ... as dead.") live in message.
+  daemon_message: "message.keyword"
+
+params:
+  # The institute's own realm. Anything addressed to a different realm is
+  # proxied to the upstream (federation) server. The second pattern catches
+  # an own-realm identity that ends in a stray space, which no longer
+  # matches the realm and is therefore proxied away instead of handled here.
+  own_realm_patterns: ["*@iitb.ac.in", "*@iitb.ac.in *"]

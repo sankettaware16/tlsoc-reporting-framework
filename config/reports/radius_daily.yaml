@@ -1,0 +1,1007 @@
+# ===========================================================================
+# REPORT: Daily Wi-Fi / 802.1X Authentication  (profile: wifi_auth -> RADIUS)
+#
+# Design notes (all verified against the live index before writing):
+#   * Failures are DE-DUPLICATED. The server logs a second line for a
+#     session it already rejected ("...previously rejected (again)"), two
+#     lines for one failed proxy request and a message-less twin of every
+#     upstream reject; counting them inflates the failure rate by ~1.8x.
+#     `attempt` = login lines minus those follow-ups.
+#   * source.ip is the controller (NAS), not the client. The client device is
+#     the calling-station MAC, so "who is misbehaving" is answered per device
+#     and per account, never per source IP.
+#   * Spraying is one DEVICE failing as many different ACCOUNTS (or one
+#     account failing from many devices). A single device retrying a single
+#     account all day is a stale saved password / expired account, not an
+#     attack - the two are reported separately.
+#   * Identities whose realm is not a domain name (a password typed after
+#     the "@", a typo) or that carry stray whitespace can never authenticate;
+#     they are proxied upstream and go unanswered. They are separated from
+#     real upstream trouble so the report does not call that an outage.
+# ===========================================================================
+name: radius_daily
+slug: daily_radius        # output filename prefix: <slug>_<datasource>_<date>
+title: "Daily Wi-Fi Authentication Report"
+profile: wifi_auth
+description: >
+  Executive daily report for FreeRADIUS (802.1X / eduroam) logs: attempt
+  volume and success rate, why authentications fail, devices and accounts
+  that keep failing, roaming (visiting-realm) logins, and the health of the
+  upstream federation servers.
+
+_defs:
+  login: &login {field: event_action, equals: radius_login}
+  failed: &failed {field: outcome, equals: failure}
+  succeeded: &succeeded {field: outcome, equals: success}
+
+  # -- identity classes (the realm is whatever follows the "@") ------------
+  has_realm: &has_realm {field: user, wildcard: "*@*"}
+  dotted_realm: &dotted_realm {field: user, wildcard: "*@*.*"}
+  own_realm: &own_realm {field: user, wildcard_param: own_realm_patterns}
+  passpoint: &passpoint {field: user, wildcard_param: passpoint_realm_patterns}
+  placeholder: &placeholder {field: user, in_param: placeholder_identities}
+  # Realm is not a domain name (no dot): a typo, or "name@password".
+  malformed_realm: &malformed_realm
+    all:
+      - *has_realm
+      - none: [*dotted_realm]
+  # Whitespace around an identity that carries a realm. A trailing space on
+  # a bare username is harmless (the server trims it: tens of thousands of
+  # such logins succeed), but "name@realm " no longer matches the realm and
+  # is proxied away instead of handled locally.
+  padded: &padded
+    all:
+      - *has_realm
+      - {field: user, wildcard: ["* ", " *"]}
+  # An identity addressed to another institution's real realm.
+  routable: &routable
+    all:
+      - *has_realm
+      - none: [*own_realm, *malformed_realm, *passpoint]
+  unroutable: &unroutable
+    any: [*malformed_realm, *padded]
+
+  # -- follow-up log lines of a failure that is already counted -------------
+  # Besides the "repeat reject" and "Failing proxied request" lines, every
+  # upstream reject ("Home Server says so") is logged a second time with no
+  # message at all: a failed login addressed to another realm, no reason.
+  proxied_twin: &proxied_twin
+    all:
+      - *failed
+      - none: [{field: error_message, exists: true}]
+      - *has_realm
+      - none: [*own_realm]
+  duplicate_line: &duplicate_line
+    any:
+      - {field: error_message, prefix_param: duplicate_message_prefixes}
+      - *proxied_twin
+
+  # One real authentication attempt, and the failed subset of it.
+  attempt: &attempt
+    all:
+      - *login
+      - none: [*duplicate_line]
+  failed_attempt: &failed_attempt
+    all:
+      - *attempt
+      - *failed
+
+  # -- upstream / federation ------------------------------------------------
+  unanswered: &unanswered
+    all:
+      - {field: event_action, equals: proxy_request_failed}
+      - {field: upstream_port, equals: $upstream_auth_port}
+  acct_unanswered: &acct_unanswered
+    all:
+      - {field: event_action, equals: proxy_request_failed}
+      - {field: upstream_port, equals: $upstream_acct_port}
+
+params:
+  window_hours: 24
+  top_n: 10
+  prev_window_min_ratio: 0.5
+
+  # Failure share of real attempts (after de-duplication). The campus
+  # baseline sits near 2.3%, so amber starts well above it.
+  fail_rate_warn: 5.0
+  fail_rate_crit: 15.0
+
+  # Log lines that repeat a failure already counted elsewhere (prefix match).
+  duplicate_message_prefixes:
+    - "eap_peap: The users session was previously rejected"
+    - "Failing proxied request"
+
+  # Outer identities that are not an account (a supplicant that sends
+  # "anonymous" before the tunnel is up): excluded from account tables.
+  placeholder_identities: ["anonymous", "Anonymous", "ANONYMOUS", ""]
+
+  # Realm of the automatic mobile-carrier (Passpoint / 3GPP) probes that
+  # phones send to any visited network; the upstream rejects them by design.
+  passpoint_realm_patterns: ["*.3gppnetwork.org"]
+
+  # Own-realm patterns come from the datasource (estate specific).
+  own_realm_patterns: []
+
+  # A device that fails this many times in a day is retrying in a loop
+  # (campus p90 is ~20 failed attempts per device, p99 ~150).
+  retry_device_min: 100
+  # One account failing from this many different devices: a stale password
+  # saved on several devices, a shared account, or credential guessing.
+  account_devices_min: 10
+  # One device failing as this many different accounts is the credential
+  # guessing signature (no device exceeds 3 on a normal day).
+  spray_accounts_min: 5
+
+  # Devices failing for a configuration reason (EAP method / certificate
+  # trust) before the onboarding action is raised.
+  onboarding_devices_warn: 25
+
+  # Upstream federation server ports and thresholds.
+  upstream_auth_port: 1812
+  upstream_acct_port: 1813
+  # Share of ROUTABLE visiting-realm attempts the upstream left unanswered
+  # that turns the federation badge. Baseline over the retained days is
+  # 2-5%; a single unreachable institution pushed one day to ~14%.
+  upstream_routable_fail_warn: 8.0
+  upstream_routable_fail_crit: 25.0
+  upstream_acct_fail_warn: 1000
+  # A RADIUS node whose upstream status checks all go unanswered, with at
+  # least this many checks sent, is cut off from the upstream.
+  status_check_min: 100
+  # Unroutable identities forwarded upstream before the P3 action is raised.
+  unroutable_min: 100
+
+  # Failure reasons, grouped by message prefix (first match wins nothing:
+  # prefixes are disjoint). Anything else lands in "Other / unclassified".
+  failure_reason_groups:
+    - {name: "No Wi-Fi password on account", prefix: "mschap: FAILED: No NT-Password"}
+    - {name: "Wrong password (MS-CHAPv2)",
+       prefix: "mschap: MS-CHAP2-Response is incorrect"}
+    - {name: "Wrong password (LDAP bind)",
+       prefix: "ldap: Bind credentials incorrect"}
+    - {name: "Device rejected server cert (PEAP)",
+       prefix: "eap_peap: TLS Alert read:fatal:unknown CA"}
+    - {name: "Device rejected server cert (TTLS)",
+       prefix: "eap_ttls: TLS Alert read:fatal:unknown CA"}
+    - {name: "Device aborted TLS handshake",
+       prefix: "eap_peap: TLS Alert read:fatal:internal error"}
+    - {name: "TLS protocol version mismatch",
+       prefix: "eap_peap: TLS Alert write:fatal:protocol version"}
+    - {name: "Unsupported EAP method offered",
+       prefix: "eap: No mutually acceptable types"}
+    - {name: "Upstream did not answer",
+       prefix: "Home Server failed to respond"}
+    - {name: "Rejected by home institution",
+       prefix: "Home Server says so"}
+
+queries:
+  # -- headline ---------------------------------------------------------------
+  total_attempts: {kind: count, filter: *attempt}
+  failed_attempts: {kind: count, filter: *failed_attempt}
+  repeat_lines: {kind: count,
+                 filter: {all: [*login, *duplicate_line]}}
+  unique_accounts: {kind: cardinality, field: user, filter: *attempt}
+  unique_devices: {kind: cardinality, field: client_mac, filter: *attempt}
+
+  prev_total: {kind: count, window: previous, filter: *attempt}
+  prev_failed: {kind: count, window: previous, filter: *failed_attempt}
+
+  hourly:
+    kind: date_histogram
+    interval: hour
+    filter: *attempt
+
+  hourly_failed:
+    kind: date_histogram
+    interval: hour
+    filter: *failed_attempt
+    optional: true
+
+  # -- why authentications fail -----------------------------------------------
+  failure_reasons:
+    kind: path_groups
+    field: error_message
+    groups_param: failure_reason_groups
+    other_name: "Other / unclassified"
+    filter: *failed_attempt
+    optional: true
+
+  # Configuration-type failures (not credential problems).
+  eap_mismatch_total:
+    kind: count
+    optional: true
+    filter:
+      all:
+        - *failed_attempt
+        - {field: error_message, prefix: "eap: No mutually acceptable types"}
+  eap_mismatch_devices:
+    kind: cardinality
+    field: client_mac
+    optional: true
+    filter:
+      all:
+        - *failed_attempt
+        - {field: error_message, prefix: "eap: No mutually acceptable types"}
+  cert_reject_total:
+    kind: count
+    optional: true
+    filter:
+      all:
+        - *failed_attempt
+        - {field: error_message, wildcard: "*TLS Alert read:fatal:unknown CA*"}
+  prev_cert_reject_total:
+    kind: count
+    window: previous
+    optional: true
+    filter:
+      all:
+        - *failed_attempt
+        - {field: error_message, wildcard: "*TLS Alert read:fatal:unknown CA*"}
+  cert_reject_devices:
+    kind: cardinality
+    field: client_mac
+    optional: true
+    filter:
+      all:
+        - *failed_attempt
+        - {field: error_message, wildcard: "*TLS Alert read:fatal:unknown CA*"}
+
+  # -- repeated failures: devices and accounts ---------------------------------
+  # Every device above the retry threshold (all identities): the headline
+  # "N devices cause X% of failures".
+  retry_devices_all:
+    kind: terms
+    field: client_mac
+    size: 1000
+    optional: true
+    filter: *failed_attempt
+    transforms:
+      - min_count: {value: $retry_device_min}
+
+  # The same devices with their account. Malformed-realm identities are kept
+  # out of this table (they are often a password typed into the username
+  # box); they have their own table below that never prints the identity.
+  retry_devices:
+    kind: terms
+    field: client_mac
+    size: $top_n
+    optional: true
+    filter:
+      all:
+        - *failed_attempt
+        - none: [*malformed_realm]
+    sub_aggs:
+      user: {kind: top_terms, field: user, size: 1}
+      reason: {kind: top_terms, field: error_message, size: 1}
+      nas: {kind: top_terms, field: nas_ip, size: 1}
+    transforms:
+      - min_count: {value: $retry_device_min}
+
+  malformed_devices:
+    kind: terms
+    field: client_mac
+    size: 5
+    optional: true
+    filter:
+      all:
+        - *failed_attempt
+        - *malformed_realm
+    sub_aggs:
+      nas: {kind: top_terms, field: nas_ip, size: 1}
+
+  account_many_devices:
+    kind: terms
+    field: user
+    size: 300
+    optional: true
+    filter:
+      all:
+        - *failed_attempt
+        - none: [*malformed_realm, *placeholder]
+    sub_aggs:
+      devices: {kind: cardinality, field: client_mac}
+      reason: {kind: top_terms, field: error_message, size: 1}
+    transforms:
+      - min_count: {key: devices, value: $account_devices_min}
+      - sort: {key: devices}
+      - limit: {size: $top_n}
+
+  device_many_accounts:
+    kind: terms
+    field: client_mac
+    size: 500
+    optional: true
+    filter:
+      all:
+        - *failed_attempt
+        - none: [*malformed_realm, *placeholder]
+    sub_aggs:
+      accounts: {kind: cardinality, field: user}
+      examples: {kind: top_terms, field: user, size: 3}
+      nas: {kind: top_terms, field: nas_ip, size: 1}
+    transforms:
+      - min_count: {key: accounts, value: $spray_accounts_min}
+      - sort: {key: accounts}
+      - limit: {size: $top_n}
+
+  padded_failed: {kind: count, optional: true,
+                  filter: {all: [*failed_attempt, *padded]}}
+  padded_accounts: {kind: cardinality, field: user, optional: true,
+                    filter: {all: [*failed_attempt, *padded]}}
+
+  # -- roaming: identities addressed to another institution's realm -------------
+  visiting_attempts:
+    kind: count
+    optional: true
+    filter:
+      all:
+        - *attempt
+        - *has_realm
+        - none: [*own_realm]
+  routable_attempts:
+    kind: count
+    optional: true
+    filter: {all: [*attempt, *routable]}
+  routable_ok:
+    kind: count
+    optional: true
+    filter: {all: [*login, *succeeded, *routable]}
+  malformed_attempts:
+    kind: count
+    optional: true
+    filter: {all: [*attempt, *malformed_realm]}
+  malformed_ok:
+    kind: count
+    optional: true
+    filter: {all: [*login, *succeeded, *malformed_realm]}
+  passpoint_attempts:
+    kind: count
+    optional: true
+    filter: {all: [*attempt, *passpoint]}
+  passpoint_ok:
+    kind: count
+    optional: true
+    filter: {all: [*login, *succeeded, *passpoint]}
+  padded_attempts:
+    kind: count
+    optional: true
+    filter: {all: [*attempt, *padded]}
+  padded_ok:
+    kind: count
+    optional: true
+    filter: {all: [*login, *succeeded, *padded]}
+  malformed_failed:
+    kind: count
+    optional: true
+    filter: {all: [*failed_attempt, *malformed_realm]}
+  passpoint_failed:
+    kind: count
+    optional: true
+    filter: {all: [*failed_attempt, *passpoint]}
+
+  # -- controllers and RADIUS nodes ------------------------------------------
+  nas_controllers:
+    kind: terms
+    field: nas_ip
+    size: 15
+    optional: true
+    filter: *attempt
+    sub_aggs:
+      failed: {kind: filter, filter: *failed}
+      accounts: {kind: cardinality, field: user}
+      devices: {kind: cardinality, field: client_mac}
+    transforms:
+      - derive_pct: {num: failed, to: fail_rate}
+
+  radius_servers:
+    kind: terms
+    field: server
+    size: 5
+    optional: true
+    filter: *attempt
+    sub_aggs:
+      failed: {kind: filter, filter: *failed}
+      accounts: {kind: cardinality, field: user}
+    transforms:
+      - derive_pct: {num: failed, to: fail_rate}
+
+  # -- upstream federation health ----------------------------------------------
+  upstream_auth_failed: {kind: count, optional: true, filter: *unanswered}
+  prev_upstream_auth_failed: {kind: count, window: previous, optional: true,
+                              filter: *unanswered}
+  upstream_unroutable_failed:
+    kind: count
+    optional: true
+    filter: {all: [*unanswered, *unroutable]}
+  upstream_acct_failed: {kind: count, optional: true,
+                         filter: *acct_unanswered}
+  prev_upstream_acct_failed: {kind: count, window: previous, optional: true,
+                              filter: *acct_unanswered}
+
+  hourly_unanswered:
+    kind: date_histogram
+    interval: hour
+    optional: true
+    filter: *unanswered
+
+  # Routable-identity requests the upstream did not answer: whose are they?
+  unanswered_routable_users:
+    kind: terms
+    field: user
+    size: 5
+    optional: true
+    filter:
+      all:
+        - *unanswered
+        - none: [*unroutable]
+
+  upstream_servers:
+    kind: terms
+    field: upstream_ip
+    size: 5
+    optional: true
+    filter:
+      field: event_action
+      in: [proxy_request_failed, home_server_zombie, home_server_alive,
+           status_check_no_response]
+    sub_aggs:
+      org: {kind: top_terms, field: upstream_org, size: 1}
+      auth_failed: {kind: filter, filter: *unanswered}
+      acct_failed: {kind: filter, filter: *acct_unanswered}
+      auth_zombie:
+        kind: filter
+        filter:
+          all:
+            - {field: event_action, equals: home_server_zombie}
+            - {field: upstream_port, equals: $upstream_auth_port}
+      acct_zombie:
+        kind: filter
+        filter:
+          all:
+            - {field: event_action, equals: home_server_zombie}
+            - {field: upstream_port, equals: $upstream_acct_port}
+
+  # Does each RADIUS node actually get answers from the upstream?
+  server_health:
+    kind: terms
+    field: server
+    size: 5
+    optional: true
+    filter:
+      field: event_action
+      in: [status_check_response, status_check_no_response]
+    sub_aggs:
+      answered: {kind: filter,
+                 filter: {field: event_action, equals: status_check_response}}
+      unanswered: {kind: filter,
+                   filter: {field: event_action,
+                            equals: status_check_no_response}}
+
+  daemon_notices:
+    kind: terms
+    field: daemon_message
+    size: 5
+    optional: true
+    filter: {field: event_action, equals: daemon_message}
+    sub_aggs:
+      servers: {kind: top_terms, field: server, size: 2}
+
+computed:
+  - {name: total, expr: "q.total_attempts or 0"}
+  - {name: failed, expr: "q.failed_attempts or 0"}
+  - {name: ok, expr: "c.total - c.failed"}
+  - {name: fail_rate, expr: "pct(c.failed, c.total)"}
+  - {name: success_rate, expr: "100 - c.fail_rate if c.total else 0"}
+  - name: raw_fail_rate
+    expr: "pct(c.failed + (q.repeat_lines or 0),
+               c.total + (q.repeat_lines or 0))"
+  - name: prev_reliable
+    expr: "(q.prev_total or 0) >= c.total * params.prev_window_min_ratio
+           and (q.prev_total or 0) > 0"
+  - name: delta_attempts
+    expr: "delta_pct(c.total, q.prev_total) if c.prev_reliable else None"
+  - name: data_warning
+    expr: "None if c.prev_reliable or c.total == 0 else
+           'Previous window logged only ' ~ human_int(q.prev_total) ~
+           ' attempts against ' ~ human_int(c.total) ~ ' now - trend
+           comparison suppressed (likely ingest gap).'"
+
+  - {name: retry_n, expr: "(q.retry_devices_all or []) | length"}
+  - name: retry_failures
+    expr: "(q.retry_devices_all or []) | sum(attribute='count')"
+  - {name: retry_share, expr: "pct(c.retry_failures, c.failed)"}
+
+  - name: routable_fail
+    expr: "(q.routable_attempts or 0) - (q.routable_ok or 0)"
+  - name: upstream_routable_unanswered
+    expr: "max((q.upstream_auth_failed or 0)
+              - (q.upstream_unroutable_failed or 0), 0)"
+  - name: unroutable_share
+    expr: "pct(q.upstream_unroutable_failed or 0,
+               q.upstream_auth_failed or 0)"
+  - name: upstream_routable_rate
+    expr: "pct(c.upstream_routable_unanswered, q.routable_attempts or 0)"
+  - name: unroutable_total
+    expr: "(q.malformed_failed or 0) + (q.padded_failed or 0)"
+  - name: acct_zombies
+    expr: "(q.upstream_servers or []) | sum(attribute='acct_zombie')"
+  - name: auth_zombies
+    expr: "(q.upstream_servers or []) | sum(attribute='auth_zombie')"
+  # RADIUS nodes whose status checks are never answered while another
+  # node's are: cut off from the upstream (typically an ACL / firewall).
+  - name: silent_servers
+    expr: "(q.server_health or [])
+           | selectattr('answered', 'equalto', 0)
+           | selectattr('unanswered', 'ge', params.status_check_min)
+           | list"
+  - name: answering_servers
+    expr: "(q.server_health or []) | selectattr('answered', 'gt', 0) | list"
+  - name: onboarding_devices
+    expr: "(q.eap_mismatch_devices or 0) + (q.cert_reject_devices or 0)"
+
+badges:
+  - id: auth
+    label: "Authentication health"
+    levels:
+      - {when: "c.fail_rate >= params.fail_rate_crit",
+         text: CRITICAL, color: red}
+      - {when: "c.fail_rate >= params.fail_rate_warn",
+         text: ELEVATED, color: amber}
+      - {text: HEALTHY, color: green}
+
+  # Judged on requests that COULD have been answered (a real visiting
+  # realm), never on identities that cannot be routed.
+  - id: federation
+    label: "Federation upstream"
+    levels:
+      - {when: "(q.routable_attempts or 0) == 0", text: NO TRAFFIC,
+         color: grey}
+      - {when: "c.upstream_routable_rate >= params.upstream_routable_fail_crit",
+         text: DEGRADED, color: red}
+      - {when: "c.upstream_routable_rate >= params.upstream_routable_fail_warn",
+         text: WATCH, color: amber}
+      - {text: HEALTHY, color: green}
+
+insights:
+  - when: "c.total == 0"
+    stop: true
+    text: >
+      No authentication attempts were recorded in the reporting window.
+      Verify the log pipeline and that {{ ds.index }} is receiving
+      documents.
+
+  - text: >
+      {{ human_int(c.total) }} authentication attempts from
+      {{ human_int(q.unique_accounts) }} accounts on
+      {{ human_int(q.unique_devices) }} devices
+      {%- if c.delta_attempts is not none %}
+      ({{ "▲" if c.delta_attempts > 0 else "▼" }}
+      {{ "%.1f" | format(c.delta_attempts | abs) }}% vs previous
+      {{ window.hours }}h){% endif %}.
+      {{ "%.2f" | format(c.success_rate) }}% succeeded;
+      {{ human_int(c.failed) }} ({{ "%.2f" | format(c.fail_rate) }}%) failed.
+
+  - when: "(q.repeat_lines or 0) > 0"
+    text: >
+      Failed attempts exclude {{ human_int(q.repeat_lines) }} follow-up log
+      lines (the server repeating a reject for a session it had already
+      rejected, and duplicate lines for failed proxy requests). Counting
+      them would show a {{ "%.1f" | format(c.raw_fail_rate) }}% failure rate
+      instead of {{ "%.1f" | format(c.fail_rate) }}%.
+
+  - when: "q.failure_reasons"
+    text: >
+      {% set top = q.failure_reasons[0] %}
+      The leading cause of failed attempts was "{{ top.key }}"
+      ({{ human_int(top.count) }}, {{ "%.0f" | format(pct(top.count, c.failed)) }}%)
+      {%- if q.failure_reasons | length > 1 %}, followed by
+      "{{ q.failure_reasons[1].key }}"
+      ({{ human_int(q.failure_reasons[1].count) }}){% endif %}. "No Wi-Fi
+      password on account" means the server found no Wi-Fi (NT) password
+      for the username: a mistyped username, or an account that never set
+      one.
+
+  - when: "c.retry_n > 0"
+    text: >
+      {{ c.retry_n }} device(s) each failed at least
+      {{ human_int(params.retry_device_min) }} times and account for
+      {{ "%.0f" | format(c.retry_share) }}% of all failed attempts.
+      {%- if q.retry_devices %} The heaviest retried
+      {{ human_int(q.retry_devices[0].count) }} times as account
+      {{ q.retry_devices[0].user }}.{% endif %} One device repeating one
+      account is a stale saved password, an expired account or a wrong
+      profile on that device, not an attack.
+
+  - when: "q.account_many_devices"
+    text: >
+      Account {{ q.account_many_devices[0].key }} failed from
+      {{ human_int(q.account_many_devices[0].devices) }} different devices.
+      A randomised MAC makes one phone look like several, but this many
+      devices means a password saved on several devices, a shared account,
+      or someone guessing that account's password.
+
+  - when: "q.device_many_accounts"
+    text: >
+      Device {{ q.device_many_accounts[0].key }} failed as
+      {{ human_int(q.device_many_accounts[0].accounts) }} different
+      accounts — the credential-guessing pattern (or a shared machine).
+
+  - when: "c.onboarding_devices > 0"
+    text: >
+      {% if q.eap_mismatch_devices %}{{ human_int(q.eap_mismatch_devices) }}
+      devices offered an EAP method the server does not support
+      ({{ human_int(q.eap_mismatch_total) }} failed attempts){% endif %}
+      {%- if q.eap_mismatch_devices and q.cert_reject_devices %} and
+      {% endif %}
+      {%- if q.cert_reject_devices %}{{ human_int(q.cert_reject_devices) }}
+      devices rejected the server certificate as signed by an unknown CA
+      ({{ human_int(q.cert_reject_total) }} failed attempts
+      {%- if q.prev_cert_reject_total %}, {{ human_int(q.prev_cert_reject_total) }}
+      the previous {{ window.hours }}h{% endif %}){% endif %}. These are
+      device configuration problems, not wrong passwords.
+
+  - when: "(q.visiting_attempts or 0) > 0"
+    text: >
+      {{ human_int(q.visiting_attempts) }} attempts used an identity
+      addressed to another institution's realm. Of the
+      {{ human_int(q.routable_attempts) }} with a real domain as realm,
+      {{ human_int(q.routable_ok) }} succeeded. The rest could not
+      succeed: {{ human_int(q.malformed_attempts) }} had a realm that is not
+      a domain name (a typo, or a password typed after the @) and
+      {{ human_int(q.passpoint_attempts) }} were automatic mobile-carrier
+      (3GPP Passpoint) probes, all rejected.
+
+  - when: "(q.padded_failed or 0) > 0"
+    text: >
+      {{ human_int(q.padded_failed) }} failed attempts from
+      {{ human_int(q.padded_accounts) }} accounts had whitespace around an
+      identity that carries a realm ("name@realm "). The space stops it
+      matching the realm, so it is proxied away instead of handled locally;
+      none of these attempts succeeded.
+
+  - when: "(q.upstream_auth_failed or 0) > 0"
+    text: >
+      The upstream federation server left {{ human_int(q.upstream_auth_failed) }}
+      authentication requests unanswered
+      {%- if q.prev_upstream_auth_failed %}
+      ({{ human_int(q.prev_upstream_auth_failed) }} the previous
+      {{ window.hours }}h){% endif %}.
+      {{ "%.0f" | format(c.unroutable_share) }}% of them
+      ({{ human_int(q.upstream_unroutable_failed) }}) carried an identity
+      that cannot be routed (invalid realm or stray whitespace), so most of
+      the apparent upstream failure is bad identities, not an outage; only
+      {{ human_int(c.upstream_routable_unanswered) }} unanswered requests
+      had a real realm, while visitors with a valid realm still
+      authenticated {{ human_int(q.routable_ok) }} times.
+
+  - when: "c.silent_servers"
+    text: >
+      RADIUS node {{ c.silent_servers[0].key }} sent
+      {{ human_int(c.silent_servers[0].unanswered) }} status checks to the
+      upstream and none was answered
+      {%- if c.answering_servers %}, while
+      {{ c.answering_servers[0].key }} received
+      {{ human_int(c.answering_servers[0].answered) }} answers{% endif %}.
+
+  - when: "(q.upstream_acct_failed or 0) > 0"
+    text: >
+      {{ human_int(q.upstream_acct_failed) }} accounting requests (UDP
+      {{ params.upstream_acct_port }}) to the upstream got no answer
+      {%- if q.prev_upstream_acct_failed %}
+      ({{ human_int(q.prev_upstream_acct_failed) }} the previous
+      {{ window.hours }}h){% endif %}, and the upstream flipped between
+      alive and zombie {{ human_int(c.acct_zombies) }} times on that port.
+
+  - when: "q.hourly"
+    text: >
+      {% set peak = q.hourly | max(attribute='count') %}
+      Authentication peaked around {{ peak.label }} {{ window.tz_label }}
+      with {{ human_int(peak.count) }} attempts in the hour.
+
+actions:
+  - when: "c.silent_servers"
+    priority: P3
+    owner: "RADIUS admins"
+    text: >
+      {{ c.silent_servers[0].key }} cannot reach the upstream federation
+      server: none of its {{ human_int(c.silent_servers[0].unanswered) }}
+      status checks was answered
+      {%- if c.answering_servers %}, whereas
+      {{ c.answering_servers[0].key }} gets answers{% endif %}. This is a
+      redundancy gap: if {{ c.answering_servers[0].key if c.answering_servers
+      else "the other node" }} goes down, visiting-realm logins have no
+      working path. Check that {{ c.silent_servers[0].key }}'s address is
+      accepted as a client by the upstream and that the path is open.
+
+  - when: "c.unroutable_total >= params.unroutable_min"
+    priority: P3
+    owner: "RADIUS admins"
+    text: >
+      {{ human_int(q.malformed_failed or 0) }} failed attempts used an
+      identity whose realm is not a domain name (these can never
+      authenticate) and {{ human_int(q.padded_failed or 0) }} had
+      whitespace around the realm (these would succeed once stripped). They
+      are forwarded upstream, and
+      {{ "%.0f" | format(c.unroutable_share) }}% of the requests the
+      upstream left unanswered were of this kind. Add a username policy
+      before proxying: strip surrounding whitespace and reject a realm
+      without a dot locally.
+
+  - when: "c.upstream_routable_rate >= params.upstream_routable_fail_warn
+           and c.upstream_routable_unanswered >= 100"
+    priority: P3
+    owner: "RADIUS admins"
+    text: >
+      {{ human_int(c.upstream_routable_unanswered) }} of
+      {{ human_int(q.routable_attempts) }} visiting-realm attempts with a
+      valid realm
+      ({{ "%.0f" | format(c.upstream_routable_rate) }}%) went unanswered by
+      the upstream{% if q.unanswered_routable_users %}; most affected:
+      {{ q.unanswered_routable_users[0].key }}
+      ({{ human_int(q.unanswered_routable_users[0].count) }}){% endif %}.
+      If one institution accounts for most of it, report that realm to the
+      federation operator; if it is spread out, check the link and
+      response timeouts to the upstream.
+
+  - when: "q.device_many_accounts"
+    priority: P2
+    owner: "SOC"
+    text: >
+      Device {{ q.device_many_accounts[0].key }} failed as
+      {{ human_int(q.device_many_accounts[0].accounts) }} different accounts
+      (e.g. {{ q.device_many_accounts[0].examples }}). Check whether it is a
+      shared machine; if not, treat it as credential guessing and block the
+      device on the controller.
+
+  - when: "q.account_many_devices"
+    priority: P3
+    owner: "SOC"
+    text: >
+      Account {{ q.account_many_devices[0].key }} failed from
+      {{ human_int(q.account_many_devices[0].devices) }} devices. Contact
+      the account owner: a stale password saved on their devices is the
+      usual cause; if they are not retrying, reset the password.
+
+  - when: "c.retry_n > 0 and q.retry_devices"
+    priority: P3
+    owner: "Helpdesk"
+    text: >
+      {{ c.retry_n }} device(s) retry failed logins in a loop (the top one
+      {{ human_int(q.retry_devices[0].count) }} times as
+      {{ q.retry_devices[0].user }}). Ask the account owners to update the
+      saved Wi-Fi password or re-create the profile; the Repeated Failures
+      table lists the devices.
+
+  - when: "c.onboarding_devices >= params.onboarding_devices_warn"
+    priority: P4
+    owner: "Wi-Fi team"
+    text: >
+      {{ human_int(q.eap_mismatch_devices or 0) }} devices offered an
+      unsupported EAP method and {{ human_int(q.cert_reject_devices or 0) }}
+      rejected the server certificate. Point users at the supported setup
+      (PEAP / MS-CHAPv2 with the correct CA installed) or push a managed
+      profile; a rise in certificate rejections right after a certificate
+      change means the new CA is not trusted.
+
+  - when: "(q.upstream_acct_failed or 0) >= params.upstream_acct_fail_warn"
+    priority: P4
+    owner: "RADIUS admins"
+    text: >
+      Accounting requests to the upstream went unanswered
+      {{ human_int(q.upstream_acct_failed) }} times and marked it zombie
+      {{ human_int(c.acct_zombies) }} times. If the federation does not
+      require accounting, stop forwarding it; otherwise raise it with the
+      upstream operator.
+
+sections:
+  - {type: heading, title: "Executive summary"}
+  - {type: insights}
+
+  - type: kpi_row
+    items:
+      - {label: "Authentication attempts", value: "c.total", format: int,
+         delta: "c.delta_attempts"}
+      - {label: "Success rate", value: "c.success_rate", format: pct2,
+         style: "'crit' if c.fail_rate >= params.fail_rate_crit else
+                 ('warn' if c.fail_rate >= params.fail_rate_warn
+                 else 'ok')",
+         foot: "{{ human_int(c.ok) }} succeeded"}
+      - {label: "Failed attempts", value: "c.failed", format: int,
+         style: "'crit' if c.fail_rate >= params.fail_rate_crit else
+                 ('warn' if c.fail_rate >= params.fail_rate_warn
+                 else 'ok')",
+         foot: "{{ '%.2f' | format(c.fail_rate) }}% of attempts"}
+      - {label: "Accounts", value: "q.unique_accounts", format: int}
+      - {label: "Devices", value: "q.unique_devices", format: int,
+         foot: "distinct MACs (randomised MACs count more than once)"}
+
+  - {type: heading, title: "Activity"}
+  - type: timeseries
+    title: "Authentication attempts per hour"
+    query: hourly
+    overlay: hourly_failed
+    series_label: "attempts / hour"
+    overlay_label: "failed attempts"
+
+  - {type: heading, title: "Why authentications fail"}
+  - type: bars
+    title: "Failed attempts by cause"
+    query: failure_reasons
+    color: amber
+    show_pct: true
+    note: "Each failed attempt counted once. Causes are grouped from the
+           server's own failure message; follow-up lines that repeat an
+           earlier reject are not counted again. 'No Wi-Fi password on
+           account' = no Wi-Fi (NT) password found for that username
+           (mistyped username, or the account never set one)."
+
+  - {type: heading, title: "Repeated failures: devices and accounts"}
+  - type: table
+    title: "Devices retrying failed logins"
+    query: retry_devices
+    hide_if_empty: true
+    note: "Devices that failed at least the retry threshold in the window,
+           heaviest first. One device with one account is a stale saved
+           password or expired account; MACs are as logged (randomised per
+           network on most phones)."
+    columns:
+      - {key: key, label: "Device (MAC)", format: mono, width: 130,
+         nowrap: true}
+      - {key: user, label: "Account", format: mono, max: 24}
+      - {key: count, label: "Failed attempts", format: int}
+      - {key: reason, label: "Main reason", max: 44}
+      - {key: nas, label: "Controller", format: mono, width: 104,
+         nowrap: true}
+
+  - type: table
+    title: "Accounts failing from many devices"
+    query: account_many_devices
+    hide_if_empty: true
+    note: "One account failing from many devices: a stale password saved on
+           several devices, a shared account, or password guessing."
+    columns:
+      - {key: key, label: "Account", format: mono, max: 28}
+      - {key: devices, label: "Devices", format: int}
+      - {key: count, label: "Failed attempts", format: int}
+      - {key: reason, label: "Main reason", max: 44}
+
+  - type: table
+    title: "Devices failing as many different accounts"
+    query: device_many_accounts
+    hide_if_empty: true
+    note: "The credential-guessing signature: one device trying several
+           accounts. Normal days have none."
+    columns:
+      - {key: key, label: "Device (MAC)", format: mono, width: 130,
+         nowrap: true}
+      - {key: accounts, label: "Accounts", format: int}
+      - {key: count, label: "Failed attempts", format: int}
+      - {key: examples, label: "Example accounts", format: mono, max: 36}
+      - {key: nas, label: "Controller", format: mono, width: 104,
+         nowrap: true}
+
+  - type: table
+    title: "Devices sending an unroutable identity"
+    query: malformed_devices
+    hide_if_empty: true
+    note: "Identity realm is not a domain name (a typo or a password typed
+           after the @). The identity is deliberately not printed."
+    columns:
+      - {key: key, label: "Device (MAC)", format: mono, width: 130,
+         nowrap: true}
+      - {key: count, label: "Failed attempts", format: int}
+      - {key: nas, label: "Controller", format: mono, width: 104,
+         nowrap: true}
+
+  - {type: heading, title: "Roaming: visiting-realm logins"}
+  - type: table
+    title: "Identities addressed to another realm, by type"
+    rows: "[
+      {'key': 'Valid visiting realm (a real institution)',
+       'attempts': q.routable_attempts, 'ok': q.routable_ok,
+       'failed': (q.routable_attempts or 0) - (q.routable_ok or 0)},
+      {'key': 'Realm is not a domain name (typo / password after @)',
+       'attempts': q.malformed_attempts, 'ok': q.malformed_ok,
+       'failed': (q.malformed_attempts or 0) - (q.malformed_ok or 0)},
+      {'key': 'Mobile-carrier Passpoint probes (3GPP realm)',
+       'attempts': q.passpoint_attempts, 'ok': q.passpoint_ok,
+       'failed': (q.passpoint_attempts or 0) - (q.passpoint_ok or 0)},
+      {'key': 'Realm with leading/trailing whitespace (name@realm )',
+       'attempts': q.padded_attempts, 'ok': q.padded_ok,
+       'failed': (q.padded_attempts or 0) - (q.padded_ok or 0)}]"
+    note: "Classes can overlap (a whitespace-padded realm may also be a
+           valid one). Own-realm accounts are handled locally and not
+           listed, except where whitespace made them look foreign."
+    columns:
+      - {key: key, label: "Identity type"}
+      - {key: attempts, label: "Attempts", format: int}
+      - {key: ok, label: "Succeeded", format: int}
+      - {key: failed, label: "Failed", format: int}
+
+  - {type: heading, title: "Controllers and RADIUS nodes"}
+  - type: row
+    left:
+      type: table
+      title: "Wireless controllers (NAS)"
+      query: nas_controllers
+      columns:
+        - {key: key, label: "Controller", format: mono, width: 104,
+           nowrap: true}
+        - {key: count, label: "Attempts", format: int}
+        - {key: accounts, label: "Accounts", format: int}
+        - {key: fail_rate, label: "Fail %", format: pct}
+    right:
+      type: table
+      title: "RADIUS nodes"
+      query: radius_servers
+      columns:
+        - {key: key, label: "Node"}
+        - {key: count, label: "Attempts", format: int}
+        - {key: accounts, label: "Accounts", format: int}
+        - {key: fail_rate, label: "Fail %", format: pct}
+
+  - {type: heading, title: "Upstream federation health"}
+  - type: timeseries
+    title: "Authentication requests left unanswered by the upstream, per hour"
+    query: hourly_unanswered
+    color: red
+    series_label: "unanswered / hour"
+
+  - type: table
+    title: "Upstream servers"
+    query: upstream_servers
+    hide_if_empty: true
+    note: "Auth = UDP 1812, accounting = UDP 1813. 'Zombie' counts the
+           times the node marked the server unresponsive. Auth failures
+           include identities that could not be routed - see the summary."
+    columns:
+      - {key: key, label: "Upstream", format: mono, width: 110, nowrap: true}
+      - {key: org, label: "Network", max: 28}
+      - {key: auth_failed, label: "Auth unanswered", format: int}
+      - {key: auth_zombie, label: "Auth zombie", format: int}
+      - {key: acct_failed, label: "Acct unanswered", format: int}
+      - {key: acct_zombie, label: "Acct zombie", format: int}
+
+  - type: row
+    left:
+      type: table
+      title: "Upstream status checks per RADIUS node"
+      query: server_health
+      hide_if_empty: true
+      note: "A node whose status checks are never answered cannot proxy
+             visiting-realm logins."
+      columns:
+        - {key: key, label: "Node"}
+        - {key: answered, label: "Answered", format: int}
+        - {key: unanswered, label: "Unanswered", format: int}
+    right:
+      type: table
+      title: "Visiting-realm requests unanswered by the upstream"
+      query: unanswered_routable_users
+      hide_if_empty: true
+      note: "Requests with a valid realm that got no answer."
+      columns:
+        - {key: key, label: "Identity", format: mono, max: 30}
+        - {key: count, label: "Unanswered", format: int}
+
+  - type: table
+    title: "Daemon notices"
+    query: daemon_notices
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Message", format: mono, max: 60}
+      - {key: count, label: "Times", format: int}
+      - {key: servers, label: "Node(s)", format: mono, max: 16}
+
+  - {type: heading, title: "Recommended actions"}
+  - {type: actions}
+
+  - type: text
+    title: "How to read this report"
+    body: "Attempts are authentication log lines minus the server's
+           follow-up lines for failures it already logged, so a failure is
+           counted once. Source IPs are the wireless controllers, not
+           clients; clients are the calling-station MACs, which phones
+           randomise per network (so devices are an upper bound). There is
+           no realm field in the data: the realm is the text after the @ in
+           the identity."
