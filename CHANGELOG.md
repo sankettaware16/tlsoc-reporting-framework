@@ -25,6 +25,9 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
     institute's own addresses, DNS temp-error coverage gaps and PermError
     rejects. Counts verdicts from one log line type so a transaction is
     not tripled.
+- `join` and `overlap` transforms: copy columns from another query's rows
+  with the same key (today next to the previous window), and flag rows
+  whose two value lists share an entry.
 - `suffix_param` accepts `versioned: true`, matching an asset suffix that is
   followed by a cache-busting tail (`app.js@ver=1.2.3`).
 - squid datasource: client campus location (`source.geo.name`,
@@ -174,6 +177,34 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Mail report counted log lines as messages.** The mail index holds one
+  correlated record per delivery plus several single-line SMTP events
+  (connect, disconnect, TLS, reject) per connection; every figure counted
+  all of them, inflating volume roughly tenfold and shrinking every
+  percentage. Message figures now count deliveries only; refusals at the
+  SMTP stage have their own section (reply codes, senders, sources) and
+  failed SMTP logins their own table. The outcome chart no longer counts
+  a delivery twice.
+- **Web exposure check is now per site.** A probe response is compared with
+  the site's own home page and with its responses to other probe paths, so
+  catch-all (soft-404) sites are recognised whatever the path, and every
+  path is evaluated instead of the busiest twenty. Only a response unlike
+  the site's default page raises P1. The security badge no longer turns
+  red for scanning alone.
+- **Web outage caused by a traffic surge is reported as one.** Per-domain
+  requests and visitors are compared with the previous window; when the
+  site producing most 5xx also multiplied its traffic, the action names
+  the surge and recommends site-wide rate capping instead of "check the
+  backend".
+- Terms queries larger than 20 buckets with sub-aggregations use
+  breadth-first collection: Elasticsearch 8.19 returned wrong cardinality
+  values for some buckets otherwise.
+- dns: every heavy TXT/NULL/ANY client is listed (only the tunneling shape
+  raises an action); DGA and SSH-scan checks look past the ten busiest
+  clients; counts are no longer attributed to example names.
+- proxy: the retry-loop action states how many clients were involved.
+- web: daily actions for rejected logins and critical-signature sources
+  fire on a per-address threshold and no longer duplicate each other.
 - **Reports no longer raise actions on normal behaviour.** Findings checked
   against the raw logs and corrected:
   - proxy: outbound SSH (port 22) produced a P2 every day. It is now treated
