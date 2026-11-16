@@ -41,12 +41,12 @@ params:
   # expected, and left in they occupy the top of that table every day.
   # They still appear in the traffic, bandwidth and error tables.
   # infrastructure_cidrs:
-  #   - "10.99.1.82"          # front-end proxy / load balancer
-  #   - "10.99.99.158"        # internal monitor
+  #   - "10.0.0.10"          # front-end proxy / load balancer
+  #   - "10.0.0.20"        # internal monitor
 
   # Campus/estate PUBLIC ranges, counted as internal alongside RFC-1918.
   # internal_cidrs:
-  #   - "103.21.124.0/22"
+  #   - "203.0.113.0/24"
 
   # Name for the site root and shared paths (everything under no area below).
   main_site_name: "moodle.iitb.ac.in (core & shared)"

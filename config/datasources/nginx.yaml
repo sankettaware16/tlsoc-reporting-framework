@@ -77,7 +77,7 @@ params:
 
   # Campus/estate PUBLIC ranges, counted as internal alongside RFC-1918.
   # internal_cidrs:
-  #   - "103.21.124.0/22"
+  #   - "203.0.113.0/24"
 
   # Site areas: path-mounted sections of the MAIN Drupal estate
   # (www.iitb.ac.in). With ~115 vhosts on this edge the headline
@@ -125,5 +125,5 @@ params:
 
   # Campus PUBLIC ranges to tag as INTERNAL (RFC-1918 is automatic).
   internal_cidrs: []
-  #  - "103.21.124.0/22"
-  #  - "14.139.96.0/20"
+  #  - "203.0.113.0/24"
+  #  - "198.51.100.0/24"
