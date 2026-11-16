@@ -92,6 +92,7 @@ params:
   error_rate_warn: 5.0             # % that turns the health badge amber
   error_rate_crit: 15.0            # % that turns it red
   srv_error_rate_warn: 1.0         # % 5xx considered an availability issue
+  srv_error_rate_crit: 5.0         # % 5xx that turns the health badge red
   prev_window_min_ratio: 0.5       # smaller baseline = ingest gap, not growth
   client_abort_codes: [499]
   probe_success_codes: [200, 201, 202, 203, 206]
@@ -967,13 +968,16 @@ computed:
 
 # ---------------------------------------------------------------------------
 badges:
+  # Service health is about what the SERVERS did (5xx). 4xx responses are
+  # mostly scanners and broken links hitting paths that do not exist; a
+  # high 4xx share is reported in the summary but is not a service fault.
   - id: health
     label: "Service health"
     levels:
-      - {when: "c.error_rate >= params.error_rate_crit",
+      - {when: "c.srv_error_rate >= params.srv_error_rate_crit",
          text: CRITICAL, color: red}
-      - {when: "c.error_rate >= params.error_rate_warn",
-         text: ELEVATED, color: amber}
+      - {when: "c.srv_error_rate >= params.srv_error_rate_warn",
+         text: DEGRADED, color: amber}
       - {text: HEALTHY, color: green}
   # Internet-facing sites are scanned every day, so scanning alone is not
   # a posture change. The badge turns only when a probe path was answered
@@ -1005,11 +1009,12 @@ insights:
       {{ window.hours }}h){% endif %}.
 
   - text: >
-      Error rate was {{ "%.2f" | format(c.error_rate) }}%
-      ({{ human_int(c.err_4xx + c.err_5xx) }} of {{ human_int(c.total) }}
-      requests). Server-side failures (5xx) were
-      {{ "%.2f" | format(c.srv_error_rate) }}%
-      ({{ human_int(c.err_5xx) }} requests)
+      Server-side failures (5xx) were
+      {{ "%.2f" | format(c.srv_error_rate) }}% of requests
+      ({{ human_int(c.err_5xx) }}). Client errors (4xx) were
+      {{ "%.2f" | format(pct(c.err_4xx, c.total)) }}%
+      ({{ human_int(c.err_4xx) }}) — mostly requests for paths that do not
+      exist, from scanners and broken links, which is not a service fault
       {%- if c.client_abort %}, and {{ human_int(c.client_abort) }}
       additional requests were abandoned by the client before a response
       completed — these are excluded from the error rate{% endif %}.
@@ -1402,11 +1407,12 @@ sections:
          delta: "c.delta_visitors"}
       - {label: "Bandwidth served", value: "q.total_bytes", format: bytes,
          delta: "c.delta_bytes"}
-      - {label: "Error rate", value: "c.error_rate", format: pct2,
-         delta: "c.delta_error_rate", down_is_good: true,
-         style: "'crit' if c.error_rate >= params.error_rate_crit else
-                 ('warn' if c.error_rate >= params.error_rate_warn
-                 else 'ok')"}
+      - {label: "Server error rate (5xx)", value: "c.srv_error_rate",
+         format: pct2,
+         style: "'crit' if c.srv_error_rate >= params.srv_error_rate_crit
+                 else ('warn' if c.srv_error_rate
+                 >= params.srv_error_rate_warn else 'ok')",
+         foot: "4xx + 5xx together: {{ '%.1f' | format(c.error_rate) }}%"}
 
   - type: kpi_row
     items:
