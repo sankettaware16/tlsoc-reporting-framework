@@ -43,11 +43,33 @@ params:
   # One client collecting this many NXDOMAIN answers in a day is the DGA /
   # misconfigured-agent trigger (campus average is ~140 per client).
   nxdomain_client_min: 1000
+  # Volume alone is not a DGA: a host retrying ONE stale name (an NTP pool
+  # that no longer exists) racks up thousands of NXDOMAINs too. Malware
+  # that generates domains churns through MANY distinct names, so the
+  # malware action needs at least this many; below it the host is reported
+  # as a stale-configuration case instead.
+  dga_names_min: 50
+  # Names that legitimately fail in bulk and say nothing about malware:
+  # service discovery (_ldap._tcp.dc._msdcs..., _sip._tcp...) and reverse /
+  # mDNS-style zones.
+  nxdomain_benign_names: ["_*", "*._tcp.*", "*._udp.*", "*.arpa", "*.local"]
   # Query types that carry payloads in tunneling tools (iodine, dnscat2, ...)
   # and the per-client daily volume that makes them suspicious. TXT traffic
   # for the whole campus is ~60k/day, so one host at 2k stands out.
   tunnel_qtypes: ["TXT", "NULL", "ANY"]
   tunnel_client_min: 2000
+  # A tunnel carries every message in a fresh name, so a real one spreads
+  # its queries over MANY distinct names; a monitor or mail filter repeats
+  # a few. Required in addition to the volume above.
+  tunnel_names_min: 250
+  # Never tunnels: CHAOS-class server diagnostics that health checkers poll
+  # (hostname.bind, version.bind, ...).
+  tunnel_ignore_names: ["hostname.bind", "id.server", "version.bind",
+                        "version.server", "authors.bind"]
+  # Security-vendor lookup domains that legitimately use TXT queries with
+  # unique names (wildcard patterns, matched case-insensitively). e5.sk is
+  # ESET's (LiveGrid) domain. Extend per estate in the datasource params.
+  tunnel_ignore_suffixes: ["*.e5.sk"]
   # One client above this share of all queries is a runaway process/loop.
   busy_client_share_warn: 20.0
   prev_window_min_ratio: 0.5
@@ -138,6 +160,26 @@ queries:
     transforms:
       - classify_ip: {}
 
+  # DGA candidates: NXDOMAIN volume over MANY distinct names, ignoring
+  # service-discovery and reverse-zone names. This (not the raw volume in
+  # nxdomain_clients) drives the malware insight and action.
+  dga_suspects:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    filter:
+      all:
+        - *nxdomain
+        - none: [{field: query_name, wildcard_param: nxdomain_benign_names}]
+    sub_aggs:
+      domains: {kind: cardinality, field: query_name}
+      examples: {kind: top_terms, field: query_name, size: 2}
+      site: {kind: top_terms, field: location, size: 1, missing: "Unmapped"}
+    transforms:
+      - classify_ip: {}
+      - min_count: {value: $nxdomain_client_min}
+      - min_count: {key: domains, value: $dga_names_min}
+
   refused_clients:
     kind: terms
     field: client_ip
@@ -160,12 +202,17 @@ queries:
       all:
         - {field: dns_event, equals: query}
         - {field: query_type, in_param: tunnel_qtypes}
+        - none:
+            - {field: query_name, in_param: tunnel_ignore_names}
+            - {field: query_name, wildcard_param: tunnel_ignore_suffixes}
     sub_aggs:
       domains: {kind: cardinality, field: query_name}
       qtype: {kind: top_terms, field: query_type, size: 3}
+      examples: {kind: top_terms, field: query_name, size: 2}
     transforms:
       - classify_ip: {}
       - min_count: {value: $tunnel_client_min}
+      - min_count: {key: domains, value: $tunnel_names_min}
 
   # Per-resolver-node breakdown (host.name: pdns4, ...). One node today;
   # the section is ready for the fleet and collapses to one row meanwhile.
@@ -232,6 +279,12 @@ queries:
   prev_total: {kind: count, window: previous, filter: *query_side}
 
 computed:
+  # Clients with NXDOMAIN volume but too few distinct names for a DGA:
+  # repeated lookups of the same missing name (stale configuration).
+  - name: stale_nx
+    expr: "(q.nxdomain_clients or [])
+           | selectattr('count', 'ge', params.nxdomain_client_min)
+           | selectattr('domains', 'lt', params.dga_names_min) | list"
   - {name: total, expr: "q.total_queries or 0"}
   - {name: answers, expr: "q.total_answers or 0"}
   - {name: nxdomain, expr: "q.nxdomain_total or 0"}
@@ -256,7 +309,7 @@ computed:
   - name: data_warning
     expr: "None if c.prev_reliable or c.total == 0 else
            'Previous window logged only ' ~ human_int(q.prev_total) ~
-           ' queries against ' ~ human_int(c.total) ~ ' now â€” trend
+           ' queries against ' ~ human_int(c.total) ~ ' now — trend
            comparison suppressed (likely ingest gap).'"
 
 badges:
@@ -315,16 +368,23 @@ insights:
   - when: "c.external_top_clients"
     text: >
       Non-campus (EXTERNAL) source addresses appear among the top DNS
-      clients â€” a campus resolver should serve internal clients only.
+      clients — a campus resolver should serve internal clients only.
       See the recommended actions.
 
-  - when: "q.nxdomain_clients and
-           q.nxdomain_clients[0].count >= params.nxdomain_client_min"
+  - when: "q.dga_suspects"
     text: >
-      Client {{ q.nxdomain_clients[0].key }} alone collected
-      {{ human_int(q.nxdomain_clients[0].count) }} NXDOMAIN answers across
-      {{ human_int(q.nxdomain_clients[0].domains) }} distinct names â€”
+      Client {{ q.dga_suspects[0].key }} collected
+      {{ human_int(q.dga_suspects[0].count) }} NXDOMAIN answers across
+      {{ human_int(q.dga_suspects[0].domains) }} distinct names —
       see Security signals.
+
+  - when: "c.stale_nx"
+    text: >
+      {{ c.stale_nx | length }} client(s) repeated lookups of a few
+      non-existent names thousands of times (the top one,
+      {{ c.stale_nx[0].key }}, asked for {{ c.stale_nx[0].examples }}
+      {{ human_int(c.stale_nx[0].count) }} times) — stale or mistyped
+      configuration, not malware.
 
   - when: "c.servfail > 0 and q.servfail_domains"
     text: >
@@ -335,21 +395,23 @@ insights:
 
   - when: "q.tunnel_suspects"
     text: >
-      {{ q.tunnel_suspects | length }} client(s) generated unusually heavy
-      {{ params.tunnel_qtypes | join('/') }} query volume â€” the
-      payload-carrying types tunneling tools use. See Security signals.
+      {{ q.tunnel_suspects | length }} client(s) sent heavy
+      {{ params.tunnel_qtypes | join('/') }} volume spread over hundreds of
+      distinct names. That is the shape of DNS tunneling, but also of some
+      security products and mail filters — see the example names under
+      Security signals.
 
   - when: "(q.downstream_down_total or 0) > 0"
     text: >
       dnsdist marked a downstream resolver as 'down'
-      {{ human_int(q.downstream_down_total) }} time(s) in the window â€”
+      {{ human_int(q.downstream_down_total) }} time(s) in the window —
       the exact messages are under Resolver daemon notices.
 
   - when: "q.resolvers and (q.resolver_count or 0) > 1"
     text: >
       Traffic was answered by {{ human_int(q.resolver_count) }} resolver
       nodes; the busiest was {{ q.resolvers[0].key }} with
-      {{ human_int(q.resolvers[0].queries) }} queries â€” the per-node
+      {{ human_int(q.resolvers[0].queries) }} queries — the per-node
       breakdown is under Resolution health.
 
   - when: "q.top_buildings"
@@ -374,22 +436,35 @@ actions:
     text: >
       External source addresses are querying the campus resolver:
       {{ c.external_top_clients | map(attribute='key') | join(', ') }}.
-      A campus resolver must not answer the open internet â€” verify edge
+      A campus resolver must not answer the open internet — verify edge
       ACLs and dnsdist client rules before this is abused for
       reflection/amplification.
 
-  - when: "q.nxdomain_clients and
-           q.nxdomain_clients[0].count >= params.nxdomain_client_min"
+  - when: "q.dga_suspects"
     priority: P2
     owner: "SOC"
     text: >
-      Client {{ q.nxdomain_clients[0].key }}
-      ({{ q.nxdomain_clients[0].site }}) collected
-      {{ human_int(q.nxdomain_clients[0].count) }} NXDOMAIN answers across
-      {{ human_int(q.nxdomain_clients[0].domains) }} distinct names
-      (e.g. {{ q.nxdomain_clients[0].examples }}). A sustained NXDOMAIN
-      storm from one host is the classic DGA-malware signature â€”
-      identify the process behind the lookups.
+      Client {{ q.dga_suspects[0].key }}
+      ({{ q.dga_suspects[0].site }}) collected
+      {{ human_int(q.dga_suspects[0].count) }} NXDOMAIN answers across
+      {{ human_int(q.dga_suspects[0].domains) }} distinct names
+      (e.g. {{ q.dga_suspects[0].examples }}). Many different names that
+      do not exist is the DGA-malware pattern (a dynamic-DNS parent domain
+      such as duckdns.org makes it more suspicious) — identify the process
+      behind the lookups.
+
+  - when: "c.stale_nx"
+    priority: P4
+    owner: "Network team"
+    text: >
+      {{ c.stale_nx[0].key }} ({{ c.stale_nx[0].site }}) retried
+      {{ c.stale_nx[0].examples }} {{ human_int(c.stale_nx[0].count) }}
+      times and always got NXDOMAIN. Only
+      {{ human_int(c.stale_nx[0].domains) }} distinct name(s), so this is a
+      stale setting or a discovery/update client retrying one target, not
+      malware — fix or silence the client to stop the retry loop.
+      {%- if c.stale_nx | length > 1 %} {{ c.stale_nx | length - 1 }} more
+      client(s) behave the same; see the NXDOMAIN table.{% endif %}
 
   - when: "q.tunnel_suspects"
     priority: P2
@@ -398,9 +473,11 @@ actions:
       {{ q.tunnel_suspects | map(attribute='key') | join(', ') }}
       exceeded {{ human_int(params.tunnel_client_min) }}
       {{ params.tunnel_qtypes | join('/') }} queries in
-      {{ window.hours }}h â€” the classic DNS-tunneling / exfiltration
-      profile. Inspect the querying process and the names in the
-      Security signals table.
+      {{ window.hours }}h across {{ human_int(params.tunnel_names_min) }}+
+      distinct names (e.g. {{ q.tunnel_suspects[0].examples }}). Check the
+      names: a vendor or mail-filter lookup domain is benign (add it to
+      tunnel_ignore_suffixes); random-looking subdomains of one parent
+      domain are DNS tunneling — inspect the querying process.
 
   - when: "c.servfail_rate >= params.servfail_rate_warn"
     priority: P3
@@ -418,7 +495,7 @@ actions:
     text: >
       dnsdist marked a downstream resolver as 'down'
       {{ human_int(q.downstream_down_total) }} time(s). Check the health
-      of the backend resolvers behind dnsdist â€” the exact transitions are
+      of the backend resolvers behind dnsdist — the exact transitions are
       listed under Resolver daemon notices.
 
   - when: "c.top_client_share >= params.busy_client_share_warn"
@@ -437,7 +514,7 @@ actions:
     text: >
       {{ "%.2f" | format(c.refused_rate) }}% of answers were Query
       Refused. If this is new, check dnsdist ACLs and rate-limiting
-      rules â€” either policy is over-matching legitimate clients or
+      rules — either policy is over-matching legitimate clients or
       unauthorised networks are reaching the resolver.
 
 sections:
@@ -527,7 +604,7 @@ sections:
     series_label: "failed answers / hour"
     note: "A flat floor is normal background noise (typos, stale records,
            IPv6 fallbacks). A spike concentrated in one hour usually means
-           an upstream outage or one misbehaving host â€” cross-check the
+           an upstream outage or one misbehaving host — cross-check the
            tables below."
 
   - type: row
@@ -548,7 +625,7 @@ sections:
       title: "Top SERVFAIL names"
       query: servfail_domains
       hide_if_empty: true
-      note: "Server Failure is the resolver's own inability to resolve â€”
+      note: "Server Failure is the resolver's own inability to resolve —
              broken delegations, DNSSEC failures or unreachable
              authoritative servers."
       columns:
@@ -593,7 +670,7 @@ sections:
     hide_if_empty: true
     note: "dnsdist's own operational lines: downstream resolvers marked
            up/down, security-status changes, config reloads. Tiny volume,
-           high signal â€” 'down' transitions feed a recommended action."
+           high signal — 'down' transitions feed a recommended action."
     columns:
       - {key: key, label: "Daemon message", format: mono, max: 64}
       - {key: count, label: "Times", format: int}
@@ -621,8 +698,11 @@ sections:
     query: tunnel_suspects
     hide_if_empty: true
     note: "Tunneling tools (iodine, dnscat2, ...) move data in
-           payload-carrying query types. Ordinary hosts make a handful of
-           TXT lookups a day; thousands from one client deserve a look."
+           payload-carrying query types, one fresh name per message.
+           Listed only when the volume is high AND spread over many
+           distinct names; resolver diagnostics (hostname.bind) and known
+           vendor domains are excluded. Read the example names to tell a
+           security product from a tunnel."
     columns:
       - {key: key, label: "Client IP", format: mono, width: 110, nowrap: true}
       - {key: scope, label: "Class", format: pill,
@@ -630,6 +710,7 @@ sections:
       - {key: count, label: "Queries", format: int}
       - {key: domains, label: "Distinct names", format: int}
       - {key: qtype, label: "Types", format: mono, max: 16}
+      - {key: examples, label: "Example names", format: mono, max: 34}
 
   - {type: heading, title: "Recommended actions"}
   - {type: actions}
