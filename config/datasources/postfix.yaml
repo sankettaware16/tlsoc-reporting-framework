@@ -25,6 +25,10 @@ fields:
   sasl_user: "user.name.keyword"
   auth_method: "authentication.method.keyword"
   geo_country: "source.geo.country_name"
+  # Source-side ASN enrichment (org name): tells a user roaming over one
+  # provider (Gmail "send mail as", a mobile carrier) from one account
+  # logging in across unrelated networks.
+  asn_org: "source.as.organization.name.keyword"
 
 # The originating host (e.g. the specific mail or proxy server) is NOT
 # indexed on this estate: it appears only inside event.original and is
@@ -35,4 +39,10 @@ fields:
 # then uncomment the line and re-run:
 #     python3 -m framework check-fields --datasource postfix
 
-params: {}
+params:
+  # The institute's own mail domains. The engine's email.external_recipient
+  # flag marks every departmental subdomain (ee.iitb.ac.in, cse.iitb.ac.in,
+  # ...) and upper-cased IITB.AC.IN recipients as "external", although that
+  # mail never leaves the institute; the report subtracts these patterns
+  # (case-insensitive) so "left the organisation" means what it says.
+  own_domain_patterns: ["iitb.ac.in", "*.iitb.ac.in"]
