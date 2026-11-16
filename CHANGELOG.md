@@ -9,6 +9,29 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Three new reports, so every ingested log source is covered** (seven in
+  total):
+  - `radius_daily` × `radius` (FreeRADIUS): authentication volume and
+    failure causes, retry-loop devices vs accounts failing from many
+    devices, EAP/certificate onboarding problems, roaming identities, and
+    federation upstream and accounting health. Follow-up log lines for an
+    already-rejected request are excluded so a failure counts once.
+  - `sso_daily` × `sso` (LDAP proxy + web SSO): bind volume and failure
+    rate reconciled against request records, per-node load, accounts with
+    repeated failures, credential-guessing sources, repeating OAuth/token
+    clients and accounts signing in from several countries.
+  - `fmlr_daily` × `fmlr` (policyd-spf mail gateway): SPF verdict split,
+    exactly which verdicts are rejected vs accepted, spoofing of the
+    institute's own addresses, DNS temp-error coverage gaps and PermError
+    rejects. Counts verdicts from one log line type so a transaction is
+    not tripled.
+- `suffix_param` accepts `versioned: true`, matching an asset suffix that is
+  followed by a cache-busting tail (`app.js@ver=1.2.3`).
+- squid datasource: client campus location (`source.geo.name`,
+  `source.site.zone`) and a "Usage by campus location" table.
+- postfix datasource: source ASN (`asn_org`) and the institute's own-domain
+  patterns (`own_domain_patterns`).
+
 - **Multi-domain (vhost) breakdown for web reports.** Estates whose
   datasource maps a `domain` logical field (nginx: `url.domain` from the
   vhost-first log format, ~115 domains) gain a per-domain traffic table
@@ -151,6 +174,35 @@ this repository adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Reports no longer raise actions on normal behaviour.** Findings checked
+  against the raw logs and corrected:
+  - proxy: outbound SSH (port 22) produced a P2 every day. It is now treated
+    as routine and raises an action only on scan-like use (one client
+    reaching many distinct hosts) or for other non-web ports the proxy
+    actually let through. Only CONNECT tunnels count, which removes phantom
+    VNC/TeamViewer ports caused by IPv6 addresses split into host and port.
+    The failed-connections text no longer blames the gateway when failures
+    are a few unreachable peers.
+  - dns: the DGA action fired for hosts retrying a single missing name, and
+    the tunneling action for resolver diagnostics (`hostname.bind`), a
+    security-vendor domain and a mail filter. DGA now needs many distinct,
+    non-service-discovery names; tunneling needs volume spread over many
+    names and excludes diagnostics and listed vendor domains. Repetitive
+    hosts are reported as stale configuration (P4). Example names are shown.
+  - web: critical probe paths answering 200 on many unrelated vhosts are
+    catch-all/soft-404 pages, not exposures: they no longer raise P1 and
+    produce a "return 404" action instead. Versioned static assets
+    (`.js@ver=…`) no longer count as probes. A single vhost causing nearly
+    all 5xx is reported as a single-site outage with the estate rate
+    without it, in one action instead of two.
+  - mail: the institute's own subdomains and upper-cased recipient domains
+    no longer count as "external"; SMTP-stage rejects are labelled instead
+    of looking like delivered traffic; the "many source IPs" action now
+    counts unrelated networks, so Gmail "send mail as" and mobile carriers
+    do not trigger it.
+- dns report text no longer contains mojibake (`â€”`) in place of dashes.
+- Wildcard and prefix filters with an empty pattern list match nothing
+  explicitly (`match_none`) instead of relying on an empty `bool`.
 - Web-report traffic metrics no longer count nginx error and WAF
   documents. Since the multi-vhost + NAXSI rollout the nginx index mixes
   three document shapes, and every unfiltered metric (total requests,

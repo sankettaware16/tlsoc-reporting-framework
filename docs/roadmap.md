@@ -12,6 +12,8 @@ Shipped and maintained:
 - Web-access report profile with signature-based threat analysis, probe
   attribution, auth-surface and bot analysis.
 - Live Elasticsearch backend and identical offline NDJSON backend.
+- Seven reports: web, mail, proxy, DNS, Wi-Fi (RADIUS), SSO/LDAP and the
+  mail-gateway SPF service.
 - HTML rendering with inline-SVG charts and the three-engine PDF chain.
 - Daily cron automation with per-day logs, and standalone email delivery.
 
@@ -19,13 +21,13 @@ Shipped and maintained:
 
 - Ecosystem alignment: standardized documentation, community health files, and
   release tagging (this refactoring).
-- Additional datasource examples for the engine's bundled rules (auth, mail,
-  squid).
+- Per-institution (realm) and per-sender-domain tables once the log engine
+  emits `user.domain` / `email.sender_domain` for RADIUS and the SPF gateway.
 
 ## Future
 
-- New report profiles: mail flow (Postfix), authentication activity, and
-  vulnerability-scan summaries.
+- New report profiles: vulnerability-scan summaries and threat-intelligence
+  matches.
 - Weekly and monthly rollup reports alongside the daily window.
 - Growing shared signature packs, with community contributions.
 - Optional delivery targets beyond email (webhook, shared drive).

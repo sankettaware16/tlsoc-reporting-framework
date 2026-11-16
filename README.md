@@ -29,7 +29,8 @@
 
 TLSOC Reporting is the reporting component of the
 [TLSOC platform](https://github.com/sankettaware16/tlsoc). It turns parsed
-security and infrastructure logs (nginx, Apache/Moodle, Postfix, Squid, …) into
+security and infrastructure logs (nginx, Apache/Moodle, Postfix, Squid, DNS,
+RADIUS, SSO and the mail-gateway SPF policy service) into
 daily **HTML + PDF** executive reports with KPIs, charts, attack-signature
 analysis, plain-English insights, and prioritised action items.
 
@@ -44,6 +45,23 @@ one report definition  ×  every datasource with a matching profile
 
 Adding a log source or a report type is a configuration change, not a code
 change.
+
+### Supported log sources and reports
+
+| Report (`--report`) | Slug | Datasource(s) | What it answers |
+|---|---|---|---|
+| `web_daily` | `daily_web` | `nginx`, `moodle` | Traffic, errors by domain, attack signatures, WAF, edge health |
+| `mail_daily` | `daily_mail` | `postfix` | Mail flow, SMTP-stage failures, external mail, authenticated submitters |
+| `proxy_daily` | `daily_proxy` | `squid` | Client usage, policy denials, gateway health, non-web tunnels |
+| `dns_daily` | `daily_dns` | `dns` | Resolver load, NXDOMAIN/SERVFAIL health, DGA and tunneling indicators |
+| `radius_daily` | `daily_radius` | `radius` | Wi-Fi authentication, retry loops, spraying, federation upstream health |
+| `sso_daily` | `daily_sso` | `sso` | LDAP-proxy and web SSO authentication, credential guessing |
+| `fmlr_daily` | `daily_fmlr` | `fmlr` | SPF verdicts, enforcement, spoofing of the institute's own domain |
+
+Every insight and action is derived from the day's data and thresholds are
+calibrated against real logs, so a report states what happened rather than
+generic advice: routine behaviour (outbound SSH, retrying clients, catch-all
+web pages) is reported as such and does not raise an action.
 
 ## Key Features
 
@@ -166,12 +184,16 @@ machine-parsable convention:
 daily_web_nginx_2026-07-21.pdf
 daily_mail_postfix_2026-07-21.pdf
 daily_proxy_squid_2026-07-21.pdf
+daily_dns_dns_2026-07-21.pdf
+daily_radius_radius_2026-07-21.pdf
+daily_sso_sso_2026-07-21.pdf
+daily_fmlr_fmlr_2026-07-21.pdf
 ```
 
 | Part | Meaning | Comes from |
 |---|---|---|
-| `slug` | Report kind and cadence — `daily_web`, `daily_mail`, `daily_proxy` | `slug:` in the report YAML |
-| `datasource` | Which log source produced it — `nginx`, `moodle`, `postfix`, `squid` | `name:` in the datasource YAML |
+| `slug` | Report kind and cadence — `daily_web`, `daily_mail`, `daily_proxy`, `daily_dns`, `daily_radius`, `daily_sso`, `daily_fmlr` | `slug:` in the report YAML |
+| `datasource` | Which log source produced it — `nginx`, `moodle`, `postfix`, `squid`, `dns`, `radius`, `sso`, `fmlr` | `name:` in the datasource YAML |
 | `YYYY-MM-DD` | The day the data covers (not the day it was generated) | reporting window |
 
 The `datasource` element is what keeps reports distinct when one report
