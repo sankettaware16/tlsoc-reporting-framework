@@ -129,7 +129,7 @@ def generate(report_name, datasource_name, *,
         try:
             rows = be.execute(cq)
             q[name] = apply_transforms(rows, cq.spec.get("transforms"),
-                                       params)
+                                       params, q)
         except Exception as e:  # noqa: BLE001 - a query must not kill the run
             q[name] = _empty_result(cq.kind)
             failed += 1

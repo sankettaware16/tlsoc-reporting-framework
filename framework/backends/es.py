@@ -173,6 +173,13 @@ class ESBackend:
             terms["missing"] = cq.missing
         if cq.order_by:
             terms["order"] = {cq.order_by: "desc"}
+        elif cq.sub_aggs and cq.size > 20:
+            # Elasticsearch 8.19 returns wrong cardinality sub-aggregation
+            # values for some buckets when a large terms aggregation also
+            # carries a terms sub-aggregation and is collected depth-first
+            # (seen: 2 instead of 50 distinct values). Breadth-first
+            # collection returns the correct figures.
+            terms["collect_mode"] = "breadth_first"
         body = {
             "size": 0,
             "query": self._query(cq),

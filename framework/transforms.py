@@ -6,6 +6,12 @@ Post-query row transforms, referenced from a query's `transforms:` list.
       - cluster_paths: {depth: 4}          # roll paths up by prefix
       - min_count: {value: 500}            # keep rows with count >= value
       - limit: {size: 10}
+      - join: {from: other_query, fields: {count: prev_count}}
+                                           # copy columns from another
+                                           # query's rows with the same key
+      - overlap: {a: sizes, b: home_sizes, to: same_page}
+                                           # true when two value lists share
+                                           # an entry
 
 Transforms are deliberately generic: they know nothing about nginx or
 moodle. Anything source-specific (campus CIDRs, known bot prefixes) comes
@@ -132,7 +138,41 @@ def t_sort(rows, opts, params):
                   reverse=reverse)
 
 
+def t_join(rows, opts, params, results=None):
+    """
+    Copy columns from another (earlier) query's rows that share this row's
+    key - e.g. yesterday's count next to today's. `fields` maps the source
+    column to the name it gets here. Rows with no match get None.
+    """
+    other = (results or {}).get(opts["from"]) or []
+    key = opts.get("on", "key")
+    index = {r.get(key): r for r in other if isinstance(r, dict)}
+    for r in rows:
+        match = index.get(r.get(key))
+        for src, dst in opts.get("fields", {}).items():
+            r[dst] = match.get(src) if match else None
+    return rows
+
+
+def _value_set(value):
+    return {v.strip() for v in str(value if value is not None else "").split(",")
+            if v.strip() and v.strip() != "-"}
+
+
+def t_overlap(rows, opts, params):
+    """Flag rows whose two comma-joined value lists share an entry."""
+    a, b, to = opts["a"], opts["b"], opts["to"]
+    for r in rows:
+        r[to] = bool(_value_set(r.get(a)) & _value_set(r.get(b)))
+    return rows
+
+
+# Transforms that read other queries' results (passed as `results`).
+CROSS_QUERY = {"join"}
+
 TRANSFORMS = {
+    "join": t_join,
+    "overlap": t_overlap,
     "classify_ip": t_classify_ip,
     "cluster_paths": t_cluster_paths,
     "min_count": t_min_count,
@@ -143,7 +183,7 @@ TRANSFORMS = {
 }
 
 
-def apply_transforms(rows, transform_specs, params):
+def apply_transforms(rows, transform_specs, params, results=None):
     for spec in (transform_specs or []):
         if isinstance(spec, str):
             name, opts = spec, {}
@@ -155,5 +195,8 @@ def apply_transforms(rows, transform_specs, params):
             raise ValueError(f"unknown transform '{name}'")
         if not isinstance(rows, list):
             raise ValueError(f"transform '{name}' needs row results")
-        rows = fn(rows, opts, params)
+        if name in CROSS_QUERY:
+            rows = fn(rows, opts, params, results)
+        else:
+            rows = fn(rows, opts, params)
     return rows
