@@ -111,6 +111,9 @@ params:
     - "/modules/custom/"
     - "/profiles/"
     - "/sites/default/files/"
+    # Drupal ships a stock IIS web.config in its web root; it holds no
+    # secrets (verified) and is served as a static file.
+    - "/web.config"
 
   # Login/credential surface for Drupal + SSO (matches on any vhost).
   auth_path_patterns:

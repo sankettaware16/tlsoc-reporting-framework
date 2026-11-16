@@ -69,6 +69,7 @@ _defs:
     all:
       - *serious_scope
       - {field: status_code, in_param: probe_success_codes}
+      - {field: response_bytes, range: {gt: 0}}     # content was returned
 
   # 4xx/5xx excluding client aborts (nginx 499): the real error set.
   real_errors: &real_errors
@@ -103,16 +104,29 @@ params:
   waf_ip_action_min: 200           # NAXSI blocks from ONE ip -> P2 action
   upstream_fail_warn: 1000         # upstream failures in window -> P2 action
   rl_ip_review_min: 1000           # rate-limit hits from one ip -> P3 action
+  # Rejected logins (401/403) from ONE address before it is worth an
+  # action; a user mistyping a password causes a handful.
+  auth_denied_ip_min: 100
   # One domain accounting for this share of all 5xx is a single-site
   # incident, not a platform-wide fault: the summary then states the 5xx
   # rate without it, and the P2 action names the site instead of the pool.
   single_site_share: 50.0
-  # A probe path answered 2xx on this many DIFFERENT vhosts is a catch-all /
-  # soft-404 (the site returns 200 + a default page for unknown paths), not
-  # an exposure: a real leaked file or console lives on one application. The
-  # same scanner getting 200 for /solr/admin/info/system on a dozen
-  # unrelated sites with near-identical bodies is the textbook case.
-  catchall_domains_min: 3
+  # Telling a real exposure from a catch-all page. Many sites answer HTTP
+  # 200 with a default page for ANY unknown path (a soft-404), so a 200 for
+  # /.env proves nothing by itself. A site is treated as catch-all when
+  #   * the probe response is the same size as its own home page, or
+  #   * it answered catchall_paths_min+ different exploit paths with (almost)
+  #     one response size - at most catchall_size_ratio distinct sizes per
+  #     100 paths.
+  # Only what is left is listed for review.
+  catchall_paths_min: 3
+  catchall_size_ratio: 34
+  # A domain whose requests grew by this factor over the previous window
+  # (and reached surge_min_requests) is reported as a traffic surge. When
+  # the same domain also produces most of the 5xx, the outage is load, and
+  # the action says so instead of blaming the backend alone.
+  surge_factor: 5.0
+  surge_min_requests: 50000
 
   # Estate-specific first-party prefixes come from the datasource
   # (extra_benign_path_prefixes) and are appended to this list.
@@ -439,16 +453,53 @@ queries:
   # 2xx are usually a site's own CMS pages - see probe_served_paths.
   serious_served_total: {kind: count, filter: *serious_served}
 
+  # Fallback for single-site estates (no `domain` field): the estate is one
+  # site, judged by the same catch-all rule on these two scalars.
+  serious_paths_n: {kind: cardinality, field: url_path,
+                    filter: *serious_served}
+  serious_sizes_n: {kind: cardinality, field: response_bytes,
+                    filter: *serious_served}
+
   serious_served_paths:
     kind: terms
     field: url_path
-    size: 20
+    size: 5
     filter: *serious_served
     sub_aggs:
       ip: {kind: top_terms, field: client_ip, size: 1}
-      domains: {kind: top_terms, field: domain, size: 2}
-      domain_count: {kind: cardinality, field: domain}
+
+  # Home-page response sizes per site: the reference a probe response is
+  # compared against (same size = the site served its default page).
+  home_pages:
+    kind: terms
+    field: domain
+    size: 500
+    optional: true
+    filter:
+      all:
+        - {field: url_path, equals: "/"}
+        - {field: status_code, in_param: probe_success_codes}
+    sub_aggs:
+      home_sizes: {kind: top_terms, field: response_bytes, size: 5}
+
+  # Per site: how many different critical/high probe paths were answered
+  # with content, and with how many different response sizes.
+  serious_served_sites:
+    kind: terms
+    field: domain
+    size: 500
+    optional: true
+    filter: *serious_served
+    sub_aggs:
+      paths: {kind: cardinality, field: url_path}
       sizes: {kind: cardinality, field: response_bytes}
+      probe_sizes: {kind: top_terms, field: response_bytes, size: 5}
+      top_path: {kind: top_terms, field: url_path, size: 2}
+      ip: {kind: top_terms, field: client_ip, size: 1}
+    transforms:
+      - join: {from: home_pages, fields: {home_sizes: home_sizes}}
+      - overlap: {a: probe_sizes, b: home_sizes, to: same_as_home}
+      - derive_pct: {num: sizes, den: paths, to: size_ratio}
 
   probe_paths:
     kind: terms
@@ -470,7 +521,6 @@ queries:
     sub_aggs:
       ip: {kind: top_terms, field: client_ip, size: 1}
       domains: {kind: top_terms, field: domain, size: 2}
-      domain_count: {kind: cardinality, field: domain}
 
   # Scanning & exposure per site area. path_groups buckets probe traffic by
   # the configured site_areas prefixes (+ a main-site bucket for everything
@@ -557,6 +607,23 @@ queries:
     sub_aggs:
       country: {kind: top_terms, field: geo_country, size: 1}
       posts: {kind: filter, filter: {field: method, equals: "POST"}}
+      sites: {kind: top_terms, field: domain, size: 2}
+      denied: {kind: filter, filter: {field: status_code, in: [401, 403]}}
+    transforms:
+      - classify_ip: {}
+
+  # Addresses with the most REJECTED logins - the password-guessing view.
+  auth_denied_ips:
+    kind: terms
+    field: client_ip
+    size: 5
+    optional: true
+    filter:
+      all:
+        - {field: url_path, wildcard_param: auth_path_patterns}
+        - {field: status_code, in: [401, 403]}
+    sub_aggs:
+      country: {kind: top_terms, field: geo_country, size: 1}
       sites: {kind: top_terms, field: domain, size: 2}
     transforms:
       - classify_ip: {}
@@ -745,6 +812,33 @@ queries:
     optional: true
     filter: {field: status_code, range: {gte: 500, lt: 600}}
 
+  # Requests and visitors per domain, today and in the previous window,
+  # to spot a site whose traffic multiplied (crawler / bot flood).
+  domain_load_prev:
+    kind: terms
+    field: domain
+    size: 500
+    optional: true
+    window: previous
+    filter: *access_line
+    sub_aggs:
+      visitors: {kind: cardinality, field: client_ip}
+
+  domain_load:
+    kind: terms
+    field: domain
+    size: 50
+    optional: true
+    filter: *access_line
+    sub_aggs:
+      visitors: {kind: cardinality, field: client_ip}
+      err5xx: {kind: filter,
+               filter: {field: status_code, range: {gte: 500, lt: 600}}}
+    transforms:
+      - join: {from: domain_load_prev,
+               fields: {count: prev_count, visitors: prev_visitors}}
+      - derive_pct: {num: count, den: prev_count, to: growth_pct}
+
   upstream_failure_domains:
     kind: terms
     field: domain
@@ -823,28 +917,48 @@ computed:
   - name: has_high
     expr: "q.threat_breakdown | selectattr('severity', 'equalto', 'high')
            | list | length > 0"
-  # Served critical/high paths split into catch-all answers (same path
-  # answered 2xx on many vhosts) and plausible exposures (few vhosts).
+  # Sites that answered critical/high probe paths with content, split into
+  # catch-all sites (see the catchall_* params) and sites left for review.
   - name: serious_catchall
-    expr: "(q.serious_served_paths or [])
-           | selectattr('domain_count', 'defined')
-           | selectattr('domain_count', 'ge', params.catchall_domains_min)
-           | list"
-  - name: serious_exposed
-    expr: "(q.serious_served_paths or [])
+    expr: "((q.serious_served_sites or []) | selectattr('same_as_home')
+            | list)
+           + ((q.serious_served_sites or []) | rejectattr('same_as_home')
+              | selectattr('paths', 'ge', params.catchall_paths_min)
+              | selectattr('size_ratio', 'le', params.catchall_size_ratio)
+              | list)"
+  - name: serious_review
+    expr: "(q.serious_served_sites or [])
            | rejectattr('key', 'in',
                         c.serious_catchall | map(attribute='key') | list)
            | list"
-  - name: serious_exposed_hits
-    expr: "c.serious_exposed | sum(attribute='count')"
-  - name: serious_catchall_hits
+  # Single-site estates: no per-site rows, so judge the estate as one site.
+  - name: single_estate
+    expr: "not q.serious_served_sites and (q.serious_served_total or 0) > 0"
+  - name: single_estate_catchall
+    expr: "c.single_estate
+           and (q.serious_paths_n or 0) >= params.catchall_paths_min
+           and (q.serious_sizes_n or 0) * 100
+               <= params.catchall_size_ratio * (q.serious_paths_n or 0)"
+  - name: exposure_review
+    expr: "(c.serious_review | length) > 0
+           or (c.single_estate and not c.single_estate_catchall)"
+  - name: catchall_hits
     expr: "c.serious_catchall | sum(attribute='count')"
-  - name: security_score
-    expr: "(3 if c.serious_exposed else 0)
-           + (2 if c.has_critical else 0)
-           + (1 if c.has_high else 0)
-           + (1 if (q.probe_unique_ips or 0) >= 50 else 0)
-           + (1 if (q.auth_denied or 0) >= 100 else 0)"
+
+  # Traffic surges: domains whose requests multiplied since the previous
+  # window. Empty when the previous window is unreliable (ingest gap).
+  - name: surges
+    expr: "((q.domain_load or [])
+            | selectattr('count', 'ge', params.surge_min_requests)
+            | selectattr('growth_pct', 'ge', params.surge_factor * 100)
+            | list) if c.prev_reliable else []"
+  - name: outage_surge
+    expr: "(c.surges | selectattr('key', 'equalto', c.err_5xx_top.key)
+            | list | first) if (c.err_5xx_top and c.surges) else None"
+  - name: top_site_upstream
+    expr: "((q.upstream_failure_domains or [])
+            | selectattr('key', 'equalto', c.err_5xx_top.key)
+            | list | first) if c.err_5xx_top else None"
 
   # Edge/WAF totals (None-safe; stay 0 on estates without the fields).
   - {name: waf_blocked, expr: "q.waf_total or 0"}
@@ -861,11 +975,15 @@ badges:
       - {when: "c.error_rate >= params.error_rate_warn",
          text: ELEVATED, color: amber}
       - {text: HEALTHY, color: green}
+  # Internet-facing sites are scanned every day, so scanning alone is not
+  # a posture change. The badge turns only when a probe path was answered
+  # with content that is not explained as a catch-all page.
   - id: security
     label: "Security posture"
     levels:
-      - {when: "c.security_score >= 4", text: ELEVATED, color: red}
-      - {when: "c.security_score >= 2", text: WATCH, color: amber}
+      - {when: "c.exposure_review", text: "REVIEW EXPOSURE", color: red}
+      - {when: "(q.probe_total or 0) > 0", text: "SCANNED, NO EXPOSURE SEEN",
+         color: green}
       - {text: ROUTINE, color: green}
 
 # ---------------------------------------------------------------------------
@@ -903,6 +1021,16 @@ insights:
       {{ c.err_5xx_top.key }}. Without it the estate-wide 5xx rate is
       {{ "%.2f" | format(c.err_5xx_rate_ex_top) }}% — this is a single-site
       outage, not a platform-wide fault.
+
+  - when: "c.surges"
+    text: >
+      Traffic surge: {% for r in c.surges[:2] %}{{ r.key }} received
+      {{ human_int(r.count) }} requests from {{ human_int(r.visitors) }}
+      addresses, against {{ human_int(r.prev_count) }} from
+      {{ human_int(r.prev_visitors) }} in the previous
+      {{ window.hours }}h{{ "; " if not loop.last }}{% endfor %}. Growth
+      of this size from this many addresses is automated traffic (a
+      distributed crawler or flood), not ordinary visitors.
 
   - when: "q.hourly"
     text: >
@@ -975,22 +1103,31 @@ insights:
       No requests matched the exploit, traversal, secret-file or
       foreign-CMS signature set.
 
-  - when: "c.serious_exposed"
+  - when: "c.serious_review"
     text: >
-      ATTENTION: {{ human_int(c.serious_exposed_hits) }} critical/high-
-      severity probe requests were answered with content (HTTP 2xx) on
-      {{ c.serious_exposed | length }} path(s) that no other vhost
-      answered. These are listed under Security Signals and should be
-      confirmed as intentional or blocked at the proxy.
+      ATTENTION: {{ c.serious_review | length }} site(s) answered a
+      critical/high-severity probe path with content that does not look
+      like their default page: {% for r in c.serious_review[:4] %}
+      {{ r.key }} ({{ r.top_path }}){{ "; " if not loop.last }}{% endfor %}.
+      Each needs a manual check — see Security Signals.
 
-  - when: "c.serious_catchall"
+  - when: "c.single_estate and not c.single_estate_catchall"
     text: >
-      {{ human_int(c.serious_catchall_hits) }} critical/high-severity probe
-      requests got HTTP 200, but on {{ c.serious_catchall | length }}
-      path(s) that answered 200 on
-      {{ params.catchall_domains_min }}+ different vhosts each — the
-      signature of sites returning a default page for unknown paths, not of
-      real exposure. They are not counted as exposures.
+      ATTENTION: {{ human_int(q.serious_served_total) }} critical/high-
+      severity probe requests were answered with content (HTTP 2xx), e.g.
+      {{ q.serious_served_paths[:3] | map(attribute='key') | join(', ') }}.
+      Each needs a manual check — see Security Signals.
+
+  - when: "c.serious_catchall or c.single_estate_catchall"
+    text: >
+      {% if c.serious_catchall %}{{ c.serious_catchall | length }} site(s)
+      answered critical/high-severity probe paths with HTTP 200
+      ({{ human_int(c.catchall_hits) }} requests), but each returned its
+      own default page{% else %}Critical/high-severity probe paths got HTTP
+      200 ({{ human_int(q.serious_served_total) }} requests across
+      {{ human_int(q.serious_paths_n) }} paths), but all with the same
+      response{% endif %} — the same response whatever path is asked for.
+      That is a catch-all (soft-404), not exposed content.
 
   - when: "(q.probe_served_total or 0) > (q.serious_served_total or 0)"
     text: >
@@ -1091,27 +1228,37 @@ insights:
 
 # ---------------------------------------------------------------------------
 actions:
-  - when: "c.serious_exposed"
+  - when: "c.serious_review"
     priority: P1
     owner: "SOC + Web team"
     text: >
-      Confirm why critical/high-severity probe paths returned 2xx on only
-      a few vhosts: {{ c.serious_exposed[:5] | map(attribute='key')
-      | join(', ') }} (on {{ c.serious_exposed[0].domains }}). If they are
-      not intentional, deny them at the reverse proxy and hunt for
-      follow-on activity from the same sources.
+      Open these URLs and check what they return:
+      {% for r in c.serious_review[:5] %}{{ r.key }} — {{ r.top_path }}
+      (requested by {{ r.ip }}){{ "; " if not loop.last }}{% endfor %}.
+      The response was not the site's default page, so it may be real
+      content. If it is a secret, config or admin interface, block the
+      path and rotate anything it exposed; if it is a harmless stock file,
+      add the path to the datasource's benign list so it stops appearing.
+
+  - when: "c.single_estate and not c.single_estate_catchall"
+    priority: P1
+    owner: "SOC + Web team"
+    text: >
+      Open these paths and check what they return:
+      {{ q.serious_served_paths | map(attribute='key') | join(', ') }}.
+      If any is a secret, config or admin interface, block it and rotate
+      anything it exposed; if it is a harmless stock file, add the path to
+      the datasource's benign list.
 
   - when: "c.serious_catchall"
-    priority: P3
+    priority: P4
     owner: "Web team"
     text: >
-      {{ c.serious_catchall | length }} exploit paths
-      (e.g. {{ c.serious_catchall[0].key }}) answered HTTP 200 on
-      {{ params.catchall_domains_min }}+ vhosts each, from
-      {{ c.serious_catchall[0].ip }}. Those vhosts return a default page
-      with status 200 for paths that do not exist (a soft-404). Make them
-      return 404: it removes this noise and stops scanners from believing
-      every exploit path exists.
+      {{ c.serious_catchall | length }} site(s) answer HTTP 200 with their
+      default page for paths that do not exist (e.g.
+      {{ c.serious_catchall[:4] | map(attribute='key') | join(', ') }}).
+      Nothing is exposed, but making them return 404 stops scanners from
+      recording every exploit path as present and keeps this report clean.
 
   - when: "(q.probe_served_total or 0) > (q.serious_served_total or 0)
            and q.probe_served_paths"
@@ -1127,18 +1274,38 @@ actions:
       (network ACL or MFA) rather than blocking the path outright.
 
   - when: "c.has_critical"
-    priority: P2
+    priority: P3
     owner: "SOC"
     text: >
       {% set crit = q.threat_breakdown | selectattr('severity', 'equalto',
          'critical') | list %}
-      Critical-signature activity observed
-      ({{ crit[:2] | map(attribute='title') | join(', ') }}). Add
-      {{ crit[:3] | map(attribute='top_ip') | join(', ') }} to the
-      fail2ban / WAF blocklist and confirm no matching 2xx responses exist
-      for those paths.
+      The busiest sources of critical-signature probes
+      ({{ crit[:2] | map(attribute='title') | join(', ') }}) were
+      {{ crit[:3] | map(attribute='top_ip') | unique | join(', ') }}.
+      Whether any of it reached real content is answered by the exposure
+      check above. Block these addresses at the edge if they are not
+      already blocked.
 
-  - when: "c.srv_error_rate >= params.srv_error_rate_warn"
+  - when: "c.srv_error_rate >= params.srv_error_rate_warn and c.outage_surge"
+    priority: P2
+    owner: "Web team + SOC"
+    text: >
+      {{ c.err_5xx_top.key }} failed under a traffic surge:
+      {{ human_int(c.outage_surge.count) }} requests from
+      {{ human_int(c.outage_surge.visitors) }} addresses, against
+      {{ human_int(c.outage_surge.prev_count) }} from
+      {{ human_int(c.outage_surge.prev_visitors) }} the day before, and
+      {{ human_int(c.outage_surge.err5xx) }} of them ended in 5xx. That is
+      about {{ "%.0f" | format(c.outage_surge.count
+      / (c.outage_surge.visitors or 1)) }} requests per address, so
+      per-address rate limits will not stop it. Cap the total request rate
+      for this site (or its heaviest pages, listed under Server Errors) at
+      the edge, or put a bot challenge in front of it, then confirm the
+      backend recovers. The rest of the estate runs at
+      {{ "%.2f" | format(c.err_5xx_rate_ex_top) }}% 5xx.
+
+  - when: "c.srv_error_rate >= params.srv_error_rate_warn
+           and not c.outage_surge"
     priority: P2
     owner: "Web team"
     text: >
@@ -1146,9 +1313,11 @@ actions:
       ({{ human_int(c.err_5xx) }} requests).
       {%- if c.single_site_5xx %} {{ "%.0f" | format(c.err_5xx_top_share) }}%
       of them are {{ c.err_5xx_top.key }}
-      ({{ human_int(c.upstream_failed) }} upstream failures at the edge,
-      backends named under Edge health): restore that site's backend; the
-      rest of the estate runs at
+      {%- if c.top_site_upstream %}
+      ({{ human_int(c.top_site_upstream.count) }} upstream failures at the
+      edge for that site, backend {{ c.top_site_upstream.backend }})
+      {%- endif %}: its traffic was not unusual, so check that site's
+      backend; the rest of the estate runs at
       {{ "%.2f" | format(c.err_5xx_rate_ex_top) }}% 5xx.
       {%- else %} Review the upstream application pool and the paths listed
       under Server Errors.{% endif %}
@@ -1189,22 +1358,28 @@ actions:
       either an aggressive crawler to block outright, or a legitimate
       integration that needs a whitelist entry.
 
-  - when: "(q.auth_denied or 0) > 0"
+  - when: "q.auth_denied_ips and
+           q.auth_denied_ips[0].count >= params.auth_denied_ip_min"
     priority: P3
     owner: "SOC"
     text: >
-      {{ human_int(q.auth_denied) }} authentication attempts were rejected
-      (401/403) across the login surface. Confirm rate limiting is
-      enforced on the login endpoints.
+      {{ q.auth_denied_ips[0].key }} ({{ q.auth_denied_ips[0].location }})
+      had {{ human_int(q.auth_denied_ips[0].count) }} logins rejected
+      (401/403){% if q.auth_denied_ips[0].sites
+      and q.auth_denied_ips[0].sites != '-' %} on
+      {{ q.auth_denied_ips[0].sites }}{% endif %}. That many rejections
+      from one address is password guessing or a broken client; block it,
+      and check whether any of its logins succeeded.
 
   - when: "q.write_methods"
-    priority: P3
+    priority: P4
     owner: "Web team"
     text: >
       Non-read HTTP methods reached the origin:
       {% for r in q.write_methods[:4] %}{{ r.key }}
       ({{ human_int(r.count) }}){{ ", " if not loop.last }}{% endfor %}.
-      If the application does not need them, reject them at the web server.
+      APIs and content editors use these legitimately; the table shows
+      the paths and sources. Reject them only on sites that have no such use.
 
   - when: "q.broken_links"
     priority: P4
@@ -1476,17 +1651,32 @@ sections:
     title: "⚠ Probe paths answered with 2xx content"
     query: probe_served_paths
     hide_if_empty: true
-    note: "Each row is an intentional public path that matches a
-           signature (a site's own CMS pages: tune the allowlist), a
-           catch-all answering 200 for everything (a path answered on many
-           Vhosts is this), or a real exposure (block and investigate).
-           Only critical/high-severity paths seen on few vhosts raise P1."
+    note: "All severities. A row is an intentional public path that matches
+           a signature (a site's own CMS pages), a catch-all page, or a
+           real exposure. The per-site table below separates the last two
+           for critical/high-severity paths."
     columns:
       - {key: key, label: "Path", format: mono, max: 44}
       - {key: count, label: "Hits", format: int}
       - {key: domains, label: "Domain(s)", max: 30}
-      - {key: domain_count, label: "Vhosts", format: int}
       - {key: ip, label: "Top source", format: mono, width: 104, nowrap: true}
+
+  - type: table
+    title: "Sites that answered critical/high probe paths with content"
+    query: serious_served_sites
+    hide_if_empty: true
+    note: "A site that returns its home page (same size) for an exploit
+           path, or one response size for many different exploit paths, is
+           serving a catch-all page, not the file asked for. A site with a
+           probe response unlike its home page is the one to check."
+    columns:
+      - {key: key, label: "Site", max: 30}
+      - {key: count, label: "Hits", format: int}
+      - {key: paths, label: "Paths", format: int}
+      - {key: sizes, label: "Distinct sizes", format: int}
+      - {key: probe_sizes, label: "Response bytes", format: mono, max: 22}
+      - {key: home_sizes, label: "Home page bytes", format: mono, max: 22}
+      - {key: top_path, label: "Example path", format: mono, max: 30}
 
   - type: samples
     title: "Latest critical/high-severity probe samples (raw evidence)"
