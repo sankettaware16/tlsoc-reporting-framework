@@ -1,0 +1,843 @@
+# ===========================================================================
+# REPORT: Daily Single Sign-On & Directory Authentication
+#         (profile: identity -> sso / LDAP proxy et al.)
+#
+# Two surfaces, reported separately because they mean different things:
+#   * the LDAP proxy - directory binds made by service hosts (mail). Its
+#     `source` is the calling service host, not the end user, and its
+#     failures carry no reason code;
+#   * web SSO - interactive logins, 2FA, OAuth/SAML. Its source is the real
+#     client address and its failures carry a reason.
+#
+# Counting rules that keep the numbers honest:
+#   * an LDAP "attempt" record has outcome unknown - it is a request, not a
+#     result. Authentications are the SUCCESS and FAILURE records; attempts
+#     are only reconciled against them (a gap means requests that never got
+#     an answer).
+#   * the LDAP proxy only knows the calling host, so credential-guessing by
+#     SOURCE is judged on the web side; on the LDAP side the unit is the
+#     ACCOUNT.
+# ===========================================================================
+name: sso_daily
+slug: daily_sso            # output filename prefix: <slug>_<datasource>_<date>
+title: "Daily Single Sign-On & Directory Authentication Report"
+profile: identity
+description: >
+  Executive daily report for single sign-on and LDAP-proxy logs:
+  authentication volume and failure rate, accounts failing repeatedly,
+  failing integrations, credential-guessing sources, sign-ins from several
+  countries, and per-node load and health.
+
+_defs:
+  # -- LDAP proxy ------------------------------------------------------------
+  ldap_scope: &ldap_scope {field: protocol, equals: ldap}
+  web_scope: &web_scope
+    none: [{field: protocol, equals: ldap}]
+
+  ldap_attempt: &ldap_attempt
+    all:
+      - *ldap_scope
+      - {field: event_action, equals: $ldap_attempt_action}
+  ldap_ok: &ldap_ok
+    all:
+      - *ldap_scope
+      - {field: event_action, equals: $ldap_success_action}
+  ldap_fail: &ldap_fail
+    all:
+      - *ldap_scope
+      - {field: event_action, equals: $ldap_fail_action}
+  # A RESULT: the bind was answered (success or failure).
+  ldap_result: &ldap_result
+    all:
+      - *ldap_scope
+      - {field: event_action,
+         in: [$ldap_success_action, $ldap_fail_action]}
+
+  # -- web SSO -----------------------------------------------------------------
+  web_signin_ok: &web_signin_ok
+    all:
+      - *web_scope
+      - {field: event_action, in_param: web_signin_ok_actions}
+  web_signin_fail: &web_signin_fail
+    all:
+      - *web_scope
+      - {field: event_action, in_param: web_signin_fail_actions}
+  web_failure: &web_failure
+    all:
+      - *web_scope
+      - {field: outcome, equals: failure}
+  web_integration_fail: &web_integration_fail
+    all:
+      - *web_scope
+      - {field: event_action, in_param: oauth_fail_actions}
+  scripted_client: &scripted_client
+    all:
+      - *web_scope
+      - {field: user_agent, contains_param: scripted_ua_terms}
+
+params:
+  window_hours: 24
+  top_n: 10
+  prev_window_min_ratio: 0.5
+
+  # Event names of this estate's engine (override in the datasource when
+  # another IdP uses other names).
+  ldap_attempt_action: ldap_proxy_auth_attempt
+  ldap_success_action: ldap_proxy_auth_success
+  ldap_fail_action: ldap_proxy_authfail
+  web_signin_ok_actions: [user_login_success]
+  web_signin_fail_actions: [user_login_fail]
+  # Any successful step of an interactive sign-in (password, 2FA, device,
+  # U2F): used for the "several countries" check.
+  web_auth_success_actions: [user_login_success, user_password_auth_success,
+                             user_prompt_challenge_success,
+                             user_u2f_auth_success, user_device_auth_success]
+  # Machine-to-machine failures: OAuth authorize / token / userinfo, and
+  # personal-access-token logins.
+  oauth_fail_actions: [user_authorize_fail, client_token_fail,
+                       client_get_user_fail, user_access_token_auth_fail,
+                       user_saml_authorize_fail]
+
+  # -- thresholds, calibrated on this estate's daily history ------------------
+  # LDAP failed-bind rate sits at 0.5-0.75% of results; 3% is several times
+  # the norm, 10% is a mass failure (directory or password-store trouble).
+  ldap_fail_rate_warn: 3.0
+  ldap_fail_rate_crit: 10.0
+  # Attempts that never received a success/failure record. Near zero
+  # normally (a handful straddling the window edges); a real gap means the
+  # proxy timed out or the directory behind it did not answer.
+  unresolved_warn: 1.0
+  unresolved_crit: 5.0
+  # An account failing this many binds in a day. 30-40 accounts a day cross
+  # it, almost all of them also succeed (a second, stale client); the ones
+  # that NEVER succeed are the ones worth a call.
+  ldap_fail_account_min: 100
+  # How many failing accounts to scan (ordered by failures) before the
+  # threshold; must exceed the number of accounts above the threshold.
+  ldap_fail_scan: 300
+  # Web password sign-ins: ~16-18% of attempts fail on a normal day (mistyped
+  # passwords, expired 2FA codes). Only a far higher share is notable.
+  web_signin_fail_warn: 40.0
+  # One source failing sign-ins for this many DIFFERENT usernames is credential
+  # guessing; a person mistyping stays on one or two.
+  spray_users_min: 5
+  # An account failing web sign-ins this often in a day.
+  web_fail_account_min: 5
+  # One host making this many failing OAuth/token calls in a day is an
+  # automated client stuck on bad credentials or a revoked grant.
+  oauth_fail_source_min: 100
+  # Successful sign-ins from this many countries in one day for one account.
+  multi_country_action_min: 3
+  # Non-browser clients, matched case-insensitively inside the user agent.
+  scripted_ua_terms: ["curl", "python", "guzzle", "java/", "go-http", "okhttp",
+                      "wget", "bot", "libwww", "httpclient", "node-fetch"]
+
+queries:
+  # -- totals ---------------------------------------------------------------
+  total_events: {kind: count}
+
+  ldap_attempts: {kind: count, filter: *ldap_attempt, optional: true}
+  ldap_ok_total: {kind: count, filter: *ldap_ok, optional: true}
+  ldap_fail_total: {kind: count, filter: *ldap_fail, optional: true}
+  ldap_users: {kind: cardinality, field: user, filter: *ldap_result,
+               optional: true}
+  ldap_clients: {kind: cardinality, field: client_ip, filter: *ldap_result,
+                 optional: true}
+
+  web_events: {kind: count, filter: *web_scope}
+  web_users: {kind: cardinality, field: user, filter: *web_scope}
+  web_signin_ok_total: {kind: count, filter: *web_signin_ok}
+  web_signin_fail_total: {kind: count, filter: *web_signin_fail}
+  web_failure_total: {kind: count, filter: *web_failure}
+
+  prev_ldap_results: {kind: count, window: previous, filter: *ldap_result,
+                      optional: true}
+  prev_web_events: {kind: count, window: previous, filter: *web_scope}
+
+  # -- time series ------------------------------------------------------------
+  hourly_ldap: {kind: date_histogram, interval: hour, filter: *ldap_result,
+                optional: true}
+  hourly_ldap_fail: {kind: date_histogram, interval: hour,
+                     filter: *ldap_fail, optional: true}
+  hourly_web_signin: {kind: date_histogram, interval: hour,
+                      filter: *web_signin_ok}
+  hourly_web_signin_fail: {kind: date_histogram, interval: hour,
+                           filter: *web_signin_fail}
+
+  # -- per node: both surfaces on the same SSO node --------------------------
+  nodes:
+    kind: terms
+    field: node
+    size: 10
+    sub_aggs:
+      attempts: {kind: filter, filter: *ldap_attempt}
+      results: {kind: filter, filter: *ldap_result}
+      ok: {kind: filter, filter: *ldap_ok}
+      fails: {kind: filter, filter: *ldap_fail}
+      web_n: {kind: filter, filter: *web_scope}
+    transforms:
+      - derive_pct: {num: fails, den: results, to: fail_pct}
+
+  # -- LDAP proxy ----------------------------------------------------------
+  ldap_bind_methods:
+    kind: terms
+    field: auth_type
+    size: 5
+    optional: true
+    filter: *ldap_ok
+
+  # The calling service hosts. Few (tens), so this is a host table, not a
+  # people table.
+  ldap_callers:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    optional: true
+    filter: *ldap_result
+    sub_aggs:
+      fails: {kind: filter, filter: *ldap_fail}
+      users: {kind: cardinality, field: user}
+    transforms:
+      - classify_ip: {}
+      - derive_pct: {num: fails, den: count, to: fail_pct}
+
+  # Heaviest accounts by successful binds: a mail client polling every few
+  # seconds shows up here long before it matters elsewhere.
+  ldap_top_accounts:
+    kind: terms
+    field: user
+    size: $top_n
+    optional: true
+    filter: *ldap_ok
+    sub_aggs:
+      callers: {kind: cardinality, field: client_ip}
+
+  # Accounts with the most failed binds, ordered by failures (not by total
+  # volume), each with its successes so a stale second client can be told
+  # from an account that never gets in.
+  ldap_fail_accounts_all: &fail_accounts
+    kind: terms
+    field: user
+    size: $ldap_fail_scan
+    order_by: fails
+    optional: true
+    filter: *ldap_result
+    sub_aggs:
+      fails: {kind: filter, filter: *ldap_fail}
+      ok: {kind: filter, filter: *ldap_ok}
+      callers: {kind: cardinality, field: client_ip}
+    transforms:
+      - min_count: {key: fails, value: $ldap_fail_account_min}
+      - derive_pct: {num: fails, den: count, to: fail_pct}
+
+  ldap_fail_accounts:
+    <<: *fail_accounts
+    transforms:
+      - min_count: {key: fails, value: $ldap_fail_account_min}
+      - derive_pct: {num: fails, den: count, to: fail_pct}
+      - limit: {size: $top_n}
+
+  # -- web SSO ------------------------------------------------------------------
+  web_fail_reasons:
+    kind: terms
+    field: reason
+    size: 8
+    missing: "(no reason logged)"
+    optional: true
+    filter: *web_failure
+
+  web_event_types:
+    kind: terms
+    field: event_action
+    size: 12
+    filter: *web_scope
+
+  web_apps:
+    kind: terms
+    field: app
+    size: $top_n
+    optional: true
+    filter:
+      all:
+        - *web_scope
+        - {field: app, exists: true}
+    sub_aggs:
+      users: {kind: cardinality, field: user}
+      fails: {kind: filter, filter: {field: outcome, equals: failure}}
+    transforms:
+      - derive_pct: {num: fails, den: count, to: fail_pct}
+
+  # Automated clients stuck failing OAuth / token / SAML calls, by calling
+  # host. Repeats of the same failing call from one host are a client with
+  # stale credentials or a revoked grant, not a person.
+  integration_fail_sources:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    optional: true
+    filter: *web_integration_fail
+    sub_aggs:
+      apps: {kind: top_terms, field: app, size: 2, missing: "-"}
+      calls: {kind: top_terms, field: event_action, size: 2}
+      ua: {kind: top_terms, field: user_agent, size: 1}
+      users: {kind: cardinality, field: user}
+    transforms:
+      - classify_ip: {}
+
+  scripted_events: {kind: count, filter: *scripted_client, optional: true}
+
+  scripted_clients:
+    kind: terms
+    field: user_agent
+    size: $top_n
+    optional: true
+    filter: *scripted_client
+    sub_aggs:
+      callers: {kind: cardinality, field: client_ip}
+      users: {kind: cardinality, field: user}
+
+  # -- credential-attack signals ---------------------------------------------
+  # Sources failing web password sign-ins, ranked by how many DIFFERENT
+  # usernames they tried.
+  web_fail_sources:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    order_by: users
+    optional: true
+    filter: *web_signin_fail
+    sub_aggs:
+      users: {kind: cardinality, field: user}
+      examples: {kind: top_terms, field: user, size: 3}
+      reasons: {kind: top_terms, field: reason, size: 2}
+      country: {kind: top_terms, field: geo_country, size: 1}
+    transforms:
+      - classify_ip: {}
+
+  web_fail_accounts:
+    kind: terms
+    field: user
+    size: $top_n
+    optional: true
+    filter: *web_signin_fail
+    sub_aggs:
+      reasons: {kind: top_terms, field: reason, size: 2}
+      sources: {kind: cardinality, field: client_ip}
+    transforms:
+      - min_count: {value: $web_fail_account_min}
+
+  web_countries:
+    kind: terms
+    field: geo_country
+    size: $top_n
+    optional: true
+    filter:
+      all:
+        - *web_signin_ok
+        - {field: geo_country, exists: true}
+
+  web_signins_geolocated:
+    kind: count
+    optional: true
+    filter:
+      all:
+        - *web_signin_ok
+        - {field: geo_country, exists: true}
+
+  web_signins_abroad:
+    kind: count
+    optional: true
+    filter:
+      all:
+        - *web_signin_ok
+        - {field: geo_country, exists: true}
+        - none: [{field: geo_country, equals: $home_country}]
+
+  # Accounts with successful sign-ins from more than one country in the
+  # window. Travel and VPN exits are the usual cause; three or more is rare.
+  multi_country_accounts:
+    kind: terms
+    field: user
+    size: 20
+    order_by: countries
+    optional: true
+    filter:
+      all:
+        - *web_scope
+        - {field: event_action, in_param: web_auth_success_actions}
+        - {field: geo_country, exists: true}
+    sub_aggs:
+      countries: {kind: cardinality, field: geo_country}
+      list: {kind: top_terms, field: geo_country, size: 3}
+      sources: {kind: cardinality, field: client_ip}
+    transforms:
+      - min_count: {key: countries, value: 2}
+
+computed:
+  - {name: ldap_ok, expr: "q.ldap_ok_total or 0"}
+  - {name: ldap_fail, expr: "q.ldap_fail_total or 0"}
+  - {name: ldap_results, expr: "c.ldap_ok + c.ldap_fail"}
+  - {name: ldap_fail_rate, expr: "pct(c.ldap_fail, c.ldap_results)"}
+  - {name: ldap_attempts, expr: "q.ldap_attempts or 0"}
+  - name: unresolved
+    expr: "max(c.ldap_attempts - c.ldap_results, 0)"
+  - {name: unresolved_rate, expr: "pct(c.unresolved, c.ldap_attempts)"}
+  - {name: web_events, expr: "q.web_events or 0"}
+  - {name: web_ok, expr: "q.web_signin_ok_total or 0"}
+  - {name: web_fail, expr: "q.web_signin_fail_total or 0"}
+  - {name: web_signin_fail_rate, expr: "pct(c.web_fail, c.web_ok + c.web_fail)"}
+  - name: prev_reliable
+    expr: "(q.prev_ldap_results or 0) + (q.prev_web_events or 0)
+           >= (c.ldap_results + c.web_events) * params.prev_window_min_ratio
+           and (q.prev_ldap_results or 0) + (q.prev_web_events or 0) > 0"
+  - name: delta_ldap
+    expr: "delta_pct(c.ldap_results, q.prev_ldap_results)
+           if c.prev_reliable and q.prev_ldap_results else None"
+  - name: delta_web
+    expr: "delta_pct(c.web_events, q.prev_web_events)
+           if c.prev_reliable and q.prev_web_events else None"
+  - name: data_warning
+    expr: "None if c.prev_reliable or (c.ldap_results + c.web_events) == 0
+           else 'Previous window holds far fewer records than this one -
+           trend comparison suppressed (likely an ingest gap).'"
+  # LDAP accounts above the failure threshold that never got a successful
+  # bind, vs the ones that also succeed (a second, stale client).
+  - name: never_in
+    expr: "(q.ldap_fail_accounts_all or []) | selectattr('ok', 'eq', 0)
+           | list"
+  - name: fail_accounts_n
+    expr: "(q.ldap_fail_accounts_all or []) | length"
+  - name: top_fail_account
+    expr: "(q.ldap_fail_accounts_all or [None])[0]"
+  - name: top_fail_share
+    expr: "pct(c.top_fail_account.fails, c.ldap_fail)
+           if c.top_fail_account else 0"
+  - name: spray_sources
+    expr: "(q.web_fail_sources or [])
+           | selectattr('users', 'ge', params.spray_users_min) | list"
+  - name: multi_country_many
+    expr: "(q.multi_country_accounts or [])
+           | selectattr('countries', 'ge', params.multi_country_action_min)
+           | list"
+  - name: integration_loops
+    expr: "(q.integration_fail_sources or [])
+           | selectattr('count', 'ge', params.oauth_fail_source_min) | list"
+  - name: abroad_share
+    expr: "pct(q.web_signins_abroad or 0, q.web_signins_geolocated or 0)"
+  - name: scripted_share
+    expr: "pct(q.scripted_events or 0, c.web_events)"
+
+badges:
+  # Reads NO DATA when the index holds no LDAP-proxy records.
+  - id: directory
+    label: "Directory authentication"
+    levels:
+      - {when: "c.ldap_results == 0 and c.ldap_attempts == 0",
+         text: NO DATA, color: grey}
+      - {when: "c.ldap_fail_rate >= params.ldap_fail_rate_crit
+                or c.unresolved_rate >= params.unresolved_crit",
+         text: DEGRADED, color: red}
+      - {when: "c.ldap_fail_rate >= params.ldap_fail_rate_warn
+                or c.unresolved_rate >= params.unresolved_warn",
+         text: WATCH, color: amber}
+      - {text: HEALTHY, color: green}
+  - id: credentials
+    label: "Web credential guessing"
+    levels:
+      - {when: "c.spray_sources", text: DETECTED, color: red}
+      - {text: NONE SEEN, color: green}
+
+insights:
+  - when: "c.ldap_results == 0 and c.web_events == 0"
+    stop: true
+    text: >
+      No authentication records were found in the reporting window. Verify
+      the log pipeline and that {{ ds.index }} is receiving documents.
+
+  - when: "c.ldap_results > 0"
+    text: >
+      The LDAP proxy answered {{ human_int(c.ldap_results) }} directory
+      binds for {{ human_int(q.ldap_users) }} accounts
+      ({{ human_int(c.ldap_ok) }} succeeded, {{ human_int(c.ldap_fail) }}
+      failed = {{ "%.2f" | format(c.ldap_fail_rate) }}%)
+      {%- if c.delta_ldap is not none %}
+      ({{ "▲" if c.delta_ldap > 0 else "▼" }}
+      {{ "%.1f" | format(c.delta_ldap | abs) }}% vs previous
+      {{ window.hours }}h){% endif %}. The calling hosts are
+      {{ human_int(q.ldap_clients) }} service hosts, not end-user devices.
+
+  - when: "c.ldap_attempts > 0"
+    text: >
+      Each bind is logged twice: a request record (outcome unknown) and a
+      result record. {{ human_int(c.ldap_attempts) }} requests against
+      {{ human_int(c.ldap_results) }} results
+      {%- if c.unresolved > 0 %} leaves {{ human_int(c.unresolved) }}
+      ({{ "%.3f" | format(c.unresolved_rate) }}%) without an answer
+      {%- if c.unresolved_rate < params.unresolved_warn %} — only the few
+      requests straddling the window edges, so no sign of timeouts
+      {%- else %} — requests the proxy never answered, which points at the
+      directory behind it or at proxy timeouts{% endif %}
+      {%- else %} — every request was answered{% endif %}.
+
+  - when: "q.ldap_bind_methods and c.ldap_ok > 0"
+    text: >
+      Successful binds by method:
+      {% for r in q.ldap_bind_methods[:3] %}{{ r.key }}
+      {{ "%.0f" | format(pct(r.count, c.ldap_ok)) }}%{{ ", " if not loop.last }}
+      {%- endfor %}.
+
+  - when: "c.fail_accounts_n"
+    text: >
+      {{ human_int(c.fail_accounts_n) }} accounts failed at least
+      {{ human_int(params.ldap_fail_account_min) }} binds;
+      {% if c.never_in %}{{ human_int(c.never_in | length) }} of them never
+      succeeded (the rest also bind successfully, which points to a second,
+      stale client){% else %}all of them also bind successfully, which
+      points to a second, stale client per account{% endif %}.
+      {%- if c.top_fail_account %} The worst, {{ c.top_fail_account.key }},
+      accounts for {{ "%.0f" | format(c.top_fail_share) }}% of all failed
+      binds ({{ human_int(c.top_fail_account.fails) }} failures,
+      {{ human_int(c.top_fail_account.ok) }} successes).{% endif %}
+
+  - when: "c.web_events > 0"
+    text: >
+      Web SSO handled {{ human_int(c.web_events) }} events from
+      {{ human_int(q.web_users) }} distinct accounts
+      {%- if c.delta_web is not none %}
+      ({{ "▲" if c.delta_web > 0 else "▼" }}
+      {{ "%.1f" | format(c.delta_web | abs) }}% vs previous
+      {{ window.hours }}h){% endif %}; {{ human_int(c.web_ok) }} password
+      sign-ins succeeded and {{ human_int(c.web_fail) }} failed
+      ({{ "%.1f" | format(c.web_signin_fail_rate) }}% — {% if
+      c.web_signin_fail_rate >= params.web_signin_fail_warn %}well above{%
+      else %}within{% endif %} the normal range for mistyped passwords and
+      expired 2FA codes).
+
+  - when: "q.web_fail_reasons"
+    text: >
+      Most common web failure reason:
+      {{ q.web_fail_reasons[0].key }}
+      ({{ human_int(q.web_fail_reasons[0].count) }} of
+      {{ human_int(q.web_failure_total) }} failures).
+
+  - when: "c.scripted_share >= 5"
+    text: >
+      {{ "%.0f" | format(c.scripted_share) }}% of web SSO events came from
+      scripted (non-browser) clients — the busiest being
+      {{ q.scripted_clients[0].key | truncate(48) }}
+      ({{ human_int(q.scripted_clients[0].count) }} events) — i.e. services
+      authenticating through SSO rather than people.
+
+  - when: "c.spray_sources"
+    text: >
+      {{ c.spray_sources | length }} source(s) failed web sign-ins for
+      {{ params.spray_users_min }} or more different usernames — the
+      pattern of automated credential guessing. See Credential-attack
+      signals.
+
+  - when: "(q.web_signins_geolocated or 0) > 0 and c.abroad_share > 0"
+    text: >
+      {{ human_int(q.web_signins_abroad) }} of
+      {{ human_int(q.web_signins_geolocated) }} sign-ins from external
+      addresses ({{ "%.1f" | format(c.abroad_share) }}%) came from outside
+      {{ params.home_country }}
+      {%- if q.web_countries %}; the largest foreign source was
+      {% for r in q.web_countries if r.key != params.home_country %}
+      {%- if loop.first %}{{ r.key }} ({{ human_int(r.count) }}){% endif %}
+      {%- endfor %}{% endif %}.
+
+  - when: "q.nodes and q.nodes | length > 1"
+    text: >
+      Load was spread over {{ q.nodes | length }} SSO nodes; the busiest,
+      {{ q.nodes[0].key }}, handled
+      {{ "%.0f" | format(pct(q.nodes[0].count, q.total_events)) }}% of
+      all authentication records (LDAP requests, LDAP results and web
+      events).
+
+actions:
+  - when: "c.ldap_fail_rate >= params.ldap_fail_rate_warn
+           and c.ldap_results > 0"
+    priority: P2
+    owner: "Identity team"
+    text: >
+      {{ "%.2f" | format(c.ldap_fail_rate) }}% of directory binds failed
+      (normal is under 1%). A rate this high across many accounts points at
+      the directory or password store rather than individual users — check
+      the directory backend and the failures per node under Directory
+      authentication.
+
+  - when: "c.ldap_attempts > 0 and c.unresolved_rate >= params.unresolved_warn"
+    priority: P2
+    owner: "Identity team"
+    text: >
+      {{ human_int(c.unresolved) }} directory bind requests
+      ({{ "%.2f" | format(c.unresolved_rate) }}%) received no result
+      record. The proxy asked the directory and never logged an answer —
+      check proxy timeouts and the directory servers behind the nodes
+      listed under Directory authentication.
+
+  - when: "c.spray_sources"
+    priority: P2
+    owner: "SOC"
+    text: >
+      {% set s = c.spray_sources[0] %}
+      {{ s.key }} ({{ s.location }}{% if s.scope == 'INTERNAL' %}, internal
+      host{% endif %}) failed web sign-ins for {{ human_int(s.users) }}
+      different usernames ({{ s.examples }}) — {{ s.reasons }}. This is
+      automated credential guessing, not a user mistyping.
+      {%- if s.scope == 'EXTERNAL' %} Rate-limit or block this address at
+      the SSO login endpoint and check that none of the tried accounts then
+      signed in.
+      {%- else %} Identify the host and its owner.{% endif %}
+
+  - when: "c.never_in"
+    priority: P3
+    owner: "Mail / Identity team"
+    text: >
+      {{ human_int(c.never_in | length) }} accounts failed
+      {{ human_int(params.ldap_fail_account_min) }}+ directory binds and
+      never succeeded (top: {{ c.never_in[0].key }},
+      {{ human_int(c.never_in[0].fails) }} failures from
+      {{ human_int(c.never_in[0].callers) }} calling host(s)). Either a mail
+      client keeps retrying an old or mistyped password, or someone is
+      guessing it; the directory log does not record which. Contact the
+      owners — if one is not using mail, treat it as guessing and reset the
+      password.
+
+  - when: "c.top_fail_account and c.top_fail_share >= 10
+           and c.top_fail_account.ok > 0"
+    priority: P3
+    owner: "Mail / Identity team"
+    text: >
+      {{ c.top_fail_account.key }} alone produced
+      {{ "%.0f" | format(c.top_fail_share) }}% of all failed binds
+      ({{ human_int(c.top_fail_account.fails) }} failures vs
+      {{ human_int(c.top_fail_account.ok) }} successes from
+      {{ human_int(c.top_fail_account.callers) }} calling host(s)): the
+      account works from one client while another keeps retrying a wrong
+      password. Find the client still using the old password and update or
+      remove it.
+
+  - when: "c.integration_loops"
+    priority: P3
+    owner: "Application owners"
+    text: >
+      {% set s = c.integration_loops[0] %}
+      {{ c.integration_loops | length }} host(s) repeated failing OAuth/token
+      calls {{ human_int(params.oauth_fail_source_min) }}+ times; the
+      largest, {{ s.key }}, made {{ human_int(s.count) }}
+      (about {{ "%.0f" | format(s.count / window.hours) }} an hour:
+      {{ s.calls }}
+      {%- if s.apps and s.apps != '-' %}; application {{ s.apps }}{% endif %}
+      {%- if s.ua %}; {{ s.ua | truncate(40) }}{% endif %}). A fixed host
+      repeating a call the SSO rejects (an unknown user, an invalid access
+      token or grant) is an automated client — typically a scheduled
+      script — that its owner should correct or retire.
+
+  - when: "c.multi_country_many"
+    priority: P3
+    owner: "SOC"
+    text: >
+      {{ c.multi_country_many[0].key }} signed in successfully from
+      {{ c.multi_country_many[0].countries }} different countries
+      ({{ c.multi_country_many[0].list }}) in {{ window.hours }}h. Travel
+      and VPN exits explain most multi-country accounts, but three is rare
+      — confirm with the account owner and, if unexplained, revoke the
+      sessions and reset the password.
+
+sections:
+  - {type: heading, title: "Executive summary"}
+  - {type: insights}
+
+  - type: kpi_row
+    items:
+      - {label: "LDAP binds answered", value: "c.ldap_results", format: int,
+         delta: "c.delta_ldap"}
+      - {label: "LDAP bind failures", value: "c.ldap_fail", format: int,
+         style: "'crit' if c.ldap_fail_rate >= params.ldap_fail_rate_crit
+                 else ('warn' if c.ldap_fail_rate >=
+                 params.ldap_fail_rate_warn else 'ok')",
+         foot: "{{ '%.2f' | format(c.ldap_fail_rate) }}% of binds"}
+      - {label: "Web SSO events", value: "c.web_events", format: int,
+         delta: "c.delta_web"}
+      - {label: "Web sign-in failures", value: "c.web_fail", format: int,
+         style: "'warn' if c.web_signin_fail_rate >=
+                 params.web_signin_fail_warn else 'ok'",
+         foot: "{{ '%.1f' | format(c.web_signin_fail_rate) }}% of sign-ins"}
+
+  - {type: heading, title: "Directory (LDAP) authentication"}
+  - type: timeseries
+    title: "Directory binds per hour"
+    query: hourly_ldap
+    overlay: hourly_ldap_fail
+    series_label: "binds / hour"
+    overlay_label: "failed binds"
+    note: "Only answered binds (success + failure) are counted; request
+           records are reconciled against them in the node table."
+
+  - type: table
+    title: "SSO nodes"
+    query: nodes
+    note: "Attempts are bind requests; Succeeded + Failed are the answers.
+           Failure rate is per node. A node whose attempts clearly exceed
+           its answers is not getting replies from the directory."
+    columns:
+      - {key: key, label: "Node", format: mono}
+      - {key: attempts, label: "LDAP requests", format: int}
+      - {key: ok, label: "Succeeded", format: int}
+      - {key: fails, label: "Failed", format: int}
+      - {key: fail_pct, label: "Fail %", format: pct2}
+      - {key: web_n, label: "Web SSO events", format: int}
+
+  - type: row
+    left:
+      type: bars
+      title: "Successful binds by method"
+      query: ldap_bind_methods
+      color: navy
+      show_pct: true
+    right:
+      type: table
+      title: "Accounts with the most binds"
+      query: ldap_top_accounts
+      columns:
+        - {key: key, label: "Account", format: mono, max: 22}
+        - {key: count, label: "Binds", format: int}
+        - {key: callers, label: "Hosts", format: int}
+
+  - type: table
+    title: "LDAP proxy callers (service hosts)"
+    query: ldap_callers
+    hide_if_empty: true
+    note: "The source address on the LDAP proxy is the calling service
+           host, not the person authenticating."
+    columns:
+      - {key: key, label: "Host", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: count, label: "Binds", format: int}
+      - {key: users, label: "Accounts", format: int}
+      - {key: fails, label: "Failed", format: int}
+      - {key: fail_pct, label: "Fail %", format: pct2}
+
+  - type: table
+    title: "Accounts failing directory binds"
+    query: ldap_fail_accounts
+    hide_if_empty: true
+    note: "Accounts with at least {{ params.ldap_fail_account_min }}
+           failed binds. 'Successes' above zero means the account also
+           works from another client, so the failures come from a stale
+           password; zero successes means it never got in. The log does not
+           say why a bind failed."
+    columns:
+      - {key: key, label: "Account", format: mono, max: 26}
+      - {key: fails, label: "Failed", format: int}
+      - {key: ok, label: "Successes", format: int}
+      - {key: fail_pct, label: "Fail %", format: pct}
+      - {key: callers, label: "Hosts", format: int}
+
+  - {type: heading, title: "Web single sign-on"}
+  - type: timeseries
+    title: "Password sign-ins per hour"
+    query: hourly_web_signin
+    overlay: hourly_web_signin_fail
+    series_label: "successful sign-ins / hour"
+    overlay_label: "failed sign-ins"
+
+  - type: row
+    left:
+      type: bars
+      title: "Web failures by reason"
+      query: web_fail_reasons
+      color: red
+      show_pct: true
+    right:
+      type: bars
+      title: "Web SSO events by type"
+      query: web_event_types
+      color: navy
+
+  - type: table
+    title: "Applications using SSO"
+    query: web_apps
+    hide_if_empty: true
+    note: "SSO events per application (client id): one login produces
+           several events (authorize, user lookup, token)."
+    columns:
+      - {key: key, label: "Application", format: mono, max: 30}
+      - {key: count, label: "Events", format: int}
+      - {key: users, label: "Users", format: int}
+      - {key: fails, label: "Failed", format: int}
+      - {key: fail_pct, label: "Fail %", format: pct2}
+
+  - type: table
+    title: "Hosts repeating failing OAuth / token calls"
+    query: integration_fail_sources
+    hide_if_empty: true
+    note: "Machine clients, not people. A fixed host repeating the same
+           failing call at a steady rate is a script or service whose
+           credentials, token or user the SSO rejects."
+    columns:
+      - {key: key, label: "Host", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: count, label: "Failures", format: int}
+      - {key: calls, label: "Calls", max: 36}
+      - {key: apps, label: "Application", max: 22}
+      - {key: ua, label: "User agent", max: 28}
+
+  - type: table
+    title: "Scripted (non-browser) clients"
+    query: scripted_clients
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "User agent", max: 54}
+      - {key: count, label: "Events", format: int}
+      - {key: callers, label: "Hosts", format: int}
+      - {key: users, label: "Users", format: int}
+
+  - {type: heading, title: "Credential-attack signals"}
+  - type: table
+    title: "Sources failing web sign-ins"
+    query: web_fail_sources
+    hide_if_empty: true
+    note: "Ranked by how many different usernames each source tried. One
+           or two usernames is a person mistyping; five or more from one
+           address is credential guessing."
+    columns:
+      - {key: key, label: "Source", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: location, label: "Location", max: 20}
+      - {key: count, label: "Failures", format: int}
+      - {key: users, label: "Usernames", format: int}
+      - {key: reasons, label: "Reasons", max: 30}
+
+  - type: table
+    title: "Accounts failing web sign-ins repeatedly"
+    query: web_fail_accounts
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Account", format: mono, max: 26}
+      - {key: count, label: "Failures", format: int}
+      - {key: sources, label: "Sources", format: int}
+      - {key: reasons, label: "Reasons", max: 36}
+
+  - type: row
+    left:
+      type: bars
+      title: "Sign-ins from external addresses, by country"
+      query: web_countries
+      color: teal
+    right:
+      type: table
+      title: "Accounts signed in from several countries"
+      query: multi_country_accounts
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Account", format: mono, max: 22}
+        - {key: countries, label: "Countries", format: int}
+        - {key: list, label: "Where", max: 28}
+
+  - {type: heading, title: "Recommended actions"}
+  - {type: actions}

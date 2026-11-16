@@ -1,0 +1,64 @@
+# ===========================================================================
+# Datasource: Single sign-on / LDAP proxy (parsed by foss-soc-engine).
+#
+# One index family carries TWO different authentication surfaces, told
+# apart by `protocol`:
+#
+#   * LDAP proxy (network.protocol: ldap, process ldap-proxyN). Directory
+#     binds made by service hosts on behalf of mail users. Every request
+#     writes an `attempt` record whose outcome is "unknown" (a request, not
+#     a result), followed by a separate success or failure record. Only the
+#     results count as authentications; the report reconciles the two.
+#     source.ip here is the CALLING SERVICE HOST, never the end user's
+#     device, so per-source analysis is about service hosts, not people.
+#
+#   * Web / OAuth / SAML SSO (process ssoN). Interactive logins, 2FA,
+#     OAuth authorize/token calls and SAML assertions. source.ip is the
+#     real client address, geo-enriched for external addresses and
+#     site-enriched (source.geo.name / source.site.*) for internal ones.
+#
+# The `fields:` map translates the LOGICAL names used by report definitions
+# into concrete fields, including any .keyword suffix a field needs to be
+# aggregatable. Verified against the live fosstlsoc-logs-sso* mapping.
+# ===========================================================================
+name: sso
+label: "Single Sign-On & LDAP Proxy"
+profile: identity
+index: "fosstlsoc-logs-sso*"
+
+fields:
+  timestamp: "@timestamp"
+  user: "user.name.keyword"                    # account name or roll number
+  client_ip: "source.ip"
+  event_action: "event.action.keyword"         # ldap_proxy_* / user_login_* / ...
+  outcome: "event.outcome.keyword"             # success | failure | unknown
+  # Failure reason (ldap_unauthorized, invalid_2fa, invalid_captcha,
+  # oauth_failure, ...). Written for web SSO failures only; LDAP-proxy
+  # failures carry no reason.
+  reason: "event.reason.keyword"
+  # The application (OAuth/SAML client id, or the LDAP service name).
+  app: "sso.client_id.keyword"
+  auth_type: "sso.auth_type.keyword"           # ldapProxyPassword | automation_token
+  protocol: "network.protocol.keyword"         # "ldap" on LDAP-proxy records only
+  node: "host.name.keyword"                    # SSO1 / SSO2 / SSO3
+  process: "process.name.keyword"              # ldap-proxyN / ssoN
+  user_agent: "user_agent.original.keyword"    # web SSO only
+  # External addresses are geo-enriched; internal addresses carry the
+  # campus site name instead (source.geo.name), never a country.
+  geo_country: "source.geo.country_name"       # keyword, NO .keyword
+  geo_city: "source.geo.city_name"
+  asn_org: "source.as.organization.name.keyword"
+  site: "source.geo.name.keyword"
+  site_zone: "source.site.zone.keyword"
+  error_message: "error.message.keyword"
+
+# Not mapped on purpose:
+#   client.ip   - mapped in the index but never populated (0 documents), so
+#                 the LDAP caller and the end user cannot be told apart
+#                 from this index alone.
+#   user.email  - populated on a handful of documents only.
+
+params:
+  # The country interactive sign-ins are normally expected from; sign-ins
+  # from other countries are reported separately.
+  home_country: "India"
