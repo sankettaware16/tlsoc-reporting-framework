@@ -1,0 +1,819 @@
+# ===========================================================================
+# REPORT: Daily Mail Gateway SPF & Anti-Spoofing  (profile: spf_gateway)
+#
+# What the SPF policy service on the mail gateways saw and did. It is the
+# inbound-authentication companion of the Postfix mail-flow report: that one
+# says how much mail moved, this one says how much of it was forged or could
+# not be authenticated, and what the gateway did about it.
+#
+# Counting rule (see the fmlr datasource for the log-line catalogue): each
+# fact comes from exactly one line type, because a single transaction logs
+# several.
+#   verdicts   <- spf_check lines whose identity is the envelope sender
+#   accepted   <- spf_header_added   rejected <- spf_reject
+#   reasons    <- spf_debug (the only line carrying spf.explanation)
+# ===========================================================================
+name: fmlr_daily
+slug: daily_fmlr          # output filename prefix: <slug>_<datasource>_<date>
+title: "Daily Mail Gateway SPF & Anti-Spoofing Report"
+profile: spf_gateway
+description: >
+  Executive daily report for the SPF policy service on the mail gateways:
+  authentication verdicts, what was rejected and why, spoofing of the
+  institute's own addresses, failing sources, and gaps where SPF could not
+  be evaluated.
+
+_defs:
+  # One verdict per message that has a sender address. (Bounces with an empty
+  # sender are checked on HELO only and appear in the HELO figures, not here.)
+  mf_check: &mf_check
+    all:
+      - {field: action, equals: spf_check}
+      - {field: spf_identity, equals: mailfrom}
+  rejected: &rejected {field: action, equals: spf_reject}
+  accepted: &accepted {field: action, equals: spf_header_added}
+  skipped: &skipped {field: action, equals: spf_skipped}
+  # Debug lines are the only carrier of spf.explanation; restricted to the
+  # mail-from scope so HELO noise does not mix in.
+  mf_debug: &mf_debug
+    all:
+      - {field: action, equals: spf_debug}
+      - {field: spf_scope, equals: mailfrom}
+  # The sender claims one of the institute's own addresses.
+  own_sender: &own_sender {field: sender, wildcard_param: own_address_patterns}
+  # Addressed outside the institute.
+  foreign_rcpt: &foreign_rcpt
+    none: [{field: recipient, wildcard_param: own_address_patterns}]
+
+params:
+  window_hours: 24
+  top_n: 10
+  prev_window_min_ratio: 0.5
+  # The institute's own address patterns; the datasource supplies them.
+  own_address_patterns: []
+  # Share of mail-from verdicts that ended Temperror (SPF could not be
+  # evaluated, so the message was accepted unverified). A healthy resolver
+  # path sits under ~2% (plain DNS timeouts); the badge turns before that
+  # becomes a blind spot.
+  temperror_rate_warn: 5.0
+  temperror_rate_crit: 20.0
+  # Gateway nodes whose Temperror rates differ by less than this many
+  # percentage points are treated as equally affected (a shared cause, not a
+  # single sick node).
+  node_spread_pts: 10.0
+  # Rejects caused by the SENDER'S broken SPF record (PermError) that justify
+  # a policy review: below this it is background noise.
+  permerror_reject_min: 50
+  # One connecting address causing this many SPF-failed attempts a day is
+  # worth blocking at the edge instead of rejecting message by message.
+  fail_source_min: 50
+  # Institute-spoofing badge: failed attempts per day that count as a surge.
+  # Observed 180-750 a day (all rejected), so the amber line sits above the
+  # normal range; only an ACCEPTED spoof turns the badge red.
+  own_fail_watch: 500
+
+queries:
+  # -- volume -----------------------------------------------------------------
+  mf_total: {kind: count, filter: *mf_check}
+  unique_sources: {kind: cardinality, field: client_ip, filter: *mf_check}
+  delivered_total: {kind: count, filter: *accepted}
+  rejected_total: {kind: count, filter: *rejected}
+  skipped_total: {kind: count, optional: true, filter: *skipped}
+  node_count: {kind: cardinality, field: node, optional: true}
+
+  hourly:
+    kind: date_histogram
+    interval: hour
+    filter: *mf_check
+
+  hourly_rejected:
+    kind: date_histogram
+    interval: hour
+    filter: *rejected
+
+  hourly_temperror:
+    kind: date_histogram
+    interval: hour
+    filter:
+      all:
+        - *mf_check
+        - {field: spf_result, equals: Temperror}
+
+  prev_total: {kind: count, window: previous, filter: *mf_check}
+
+  # -- verdicts ---------------------------------------------------------------
+  results:
+    kind: terms
+    field: spf_result
+    size: 10
+    filter: *mf_check
+
+  pass_total:
+    kind: count
+    filter: {all: [*mf_check, {field: spf_result, equals: Pass}]}
+  fail_total:
+    kind: count
+    filter: {all: [*mf_check, {field: spf_result, equals: Fail}]}
+  softfail_total:
+    kind: count
+    filter: {all: [*mf_check, {field: spf_result, equals: Softfail}]}
+  neutral_total:
+    kind: count
+    filter: {all: [*mf_check, {field: spf_result, equals: Neutral}]}
+  none_total:
+    kind: count
+    filter: {all: [*mf_check, {field: spf_result, equals: "None"}]}
+  permerror_total:
+    kind: count
+    filter: {all: [*mf_check, {field: spf_result, equals: Permerror}]}
+  temperror_total:
+    kind: count
+    filter: {all: [*mf_check, {field: spf_result, equals: Temperror}]}
+
+  # -- enforcement: what the gateway did ----------------------------------------
+  # Verdict stamped on the messages that were ACCEPTED. Anything other than
+  # Pass here was let through; only Fail and PermError are refused (below).
+  accepted_by_verdict:
+    kind: terms
+    field: spf_result
+    size: 10
+    filter: *accepted
+
+  reject_fail_total:
+    kind: count
+    filter: {all: [*rejected, {field: spf_status, equals: "5.7.23"}]}
+  reject_perm_total:
+    kind: count
+    filter: {all: [*rejected, {field: spf_status, equals: "5.7.24"}]}
+
+  reject_status:
+    kind: terms
+    field: spf_status
+    size: 5
+    filter: *rejected
+
+  rejected_recipients:
+    kind: terms
+    field: recipient
+    size: $top_n
+    filter: *rejected
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+
+  # -- who fails SPF ----------------------------------------------------------
+  fail_sources:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    filter: {all: [*mf_check, {field: spf_result, equals: Fail}]}
+    sub_aggs:
+      city: {kind: top_terms, field: geo_city, size: 1}
+      country: {kind: top_terms, field: geo_country, size: 1}
+      network: {kind: top_terms, field: asn_org, size: 1}
+      senders: {kind: cardinality, field: sender}
+      recipients: {kind: cardinality, field: recipient}
+    transforms:
+      - classify_ip: {}
+
+  fail_senders:
+    kind: terms
+    field: sender
+    size: $top_n
+    filter: {all: [*mf_check, {field: spf_result, equals: Fail}]}
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+      network: {kind: top_terms, field: asn_org, size: 1}
+
+  fail_countries:
+    kind: terms
+    field: geo_country
+    size: $top_n
+    optional: true
+    filter: {all: [*mf_check, {field: spf_result, equals: Fail}]}
+
+  # Only lights up once the engine indexes the sender domain (datasource).
+  fail_domains:
+    kind: terms
+    field: sender_domain
+    size: $top_n
+    optional: true
+    filter: {all: [*mf_check, {field: spf_result, equals: Fail}]}
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+
+  # -- spoofing of the institute's own addresses ---------------------------------
+  own_checked:
+    kind: count
+    filter: {all: [*mf_check, *own_sender]}
+  own_pass:
+    kind: count
+    filter: {all: [*mf_check, *own_sender, {field: spf_result, equals: Pass}]}
+  own_fail:
+    kind: count
+    filter: {all: [*mf_check, *own_sender, {field: spf_result, equals: Fail}]}
+  own_rejected:
+    kind: count
+    filter: {all: [*rejected, *own_sender]}
+  # The dangerous case: a message claiming an institute address, failing
+  # SPF, and accepted anyway.
+  own_accepted_bad:
+    kind: count
+    filter:
+      all:
+        - *accepted
+        - *own_sender
+        - {field: spf_result, in: [Fail, Softfail]}
+  own_accepted_bad_sources:
+    kind: terms
+    field: client_ip
+    size: 3
+    filter:
+      all:
+        - *accepted
+        - *own_sender
+        - {field: spf_result, in: [Fail, Softfail]}
+  # Claiming an institute sender while addressed OUTSIDE the institute:
+  # relay probing / backscatter abuse, not a delivery to a campus mailbox.
+  own_relay_probe:
+    kind: count
+    filter: {all: [*rejected, *own_sender, *foreign_rcpt]}
+  own_relay_sources:
+    kind: cardinality
+    field: client_ip
+    filter: {all: [*rejected, *own_sender, *foreign_rcpt]}
+  own_relay_accepted:
+    kind: count
+    filter: {all: [*accepted, *own_sender, *foreign_rcpt]}
+
+  own_fail_source_count:
+    kind: cardinality
+    field: client_ip
+    filter: {all: [*mf_check, *own_sender, {field: spf_result, equals: Fail}]}
+
+  own_fail_sources:
+    kind: terms
+    field: client_ip
+    size: $top_n
+    filter: {all: [*mf_check, *own_sender, {field: spf_result, equals: Fail}]}
+    sub_aggs:
+      city: {kind: top_terms, field: geo_city, size: 1}
+      country: {kind: top_terms, field: geo_country, size: 1}
+      network: {kind: top_terms, field: asn_org, size: 1}
+      senders: {kind: cardinality, field: sender}
+      recipients: {kind: cardinality, field: recipient}
+      outside: {kind: filter, filter: *foreign_rcpt}
+    transforms:
+      - classify_ip: {}
+
+  # Networks that legitimately send AS the institute (SPF Pass): the baseline
+  # that tells an authorised relay from a forger.
+  own_pass_networks:
+    kind: terms
+    field: asn_org
+    size: 5
+    optional: true
+    filter: {all: [*mf_check, *own_sender, {field: spf_result, equals: Pass}]}
+
+  # -- verdict gaps: Temperror and Permerror ---------------------------------------
+  temperror_reasons:
+    kind: terms
+    field: spf_explanation
+    size: 5
+    filter: {all: [*mf_debug, {field: spf_result, equals: Temperror}]}
+
+  temperror_networks:
+    kind: terms
+    field: asn_org
+    size: $top_n
+    optional: true
+    filter: {all: [*mf_check, {field: spf_result, equals: Temperror}]}
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+      recipients: {kind: cardinality, field: recipient}
+
+  temperror_delivered:
+    kind: count
+    filter: {all: [*accepted, {field: spf_result, equals: Temperror}]}
+
+  temperror_domains:
+    kind: terms
+    field: sender_domain
+    size: $top_n
+    optional: true
+    filter: {all: [*mf_check, {field: spf_result, equals: Temperror}]}
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+
+  permerror_reasons:
+    kind: terms
+    field: spf_explanation
+    size: 6
+    filter: {all: [*mf_debug, {field: spf_result, equals: Permerror}]}
+
+  permerror_senders:
+    kind: terms
+    field: sender
+    size: $top_n
+    filter: {all: [*rejected, {field: spf_status, equals: "5.7.24"}]}
+    sub_aggs:
+      sources: {kind: cardinality, field: client_ip}
+      recipients: {kind: cardinality, field: recipient}
+
+  # -- gateway nodes -----------------------------------------------------------
+  nodes:
+    kind: terms
+    field: node
+    size: 10
+    optional: true
+    filter: *mf_check
+    sub_aggs:
+      temperror: {kind: filter, filter: {field: spf_result, equals: Temperror}}
+      failed: {kind: filter, filter: {field: spf_result, equals: Fail}}
+    transforms:
+      - derive_pct: {num: temperror, den: count, to: te_pct}
+
+  node_rejects:
+    kind: terms
+    field: node
+    size: 10
+    optional: true
+    filter: *rejected
+
+  # -- SPF deliberately not evaluated ---------------------------------------------
+  skipped_networks:
+    kind: terms
+    field: asn_org
+    size: 5
+    optional: true
+    filter: *skipped
+    sub_aggs:
+      helo: {kind: top_terms, field: spf_helo, size: 1}
+      reason: {kind: top_terms, field: reason, size: 1}
+
+computed:
+  - {name: mf_total, expr: "q.mf_total or 0"}
+  - {name: delivered, expr: "q.delivered_total or 0"}
+  - {name: rejected, expr: "q.rejected_total or 0"}
+  - {name: skipped, expr: "q.skipped_total or 0"}
+  - {name: screened, expr: "c.delivered + c.rejected + c.skipped"}
+  - {name: temperror, expr: "q.temperror_total or 0"}
+  - {name: temperror_rate, expr: "pct(c.temperror, c.mf_total)"}
+  - {name: pass_rate, expr: "pct(q.pass_total or 0, c.mf_total)"}
+  - {name: fail, expr: "q.fail_total or 0"}
+  - {name: own_fail, expr: "q.own_fail or 0"}
+  - {name: own_rejected, expr: "q.own_rejected or 0"}
+  - {name: own_accepted_bad, expr: "q.own_accepted_bad or 0"}
+  - name: reject_other
+    expr: "max(0, c.rejected - (q.reject_fail_total or 0)
+                  - (q.reject_perm_total or 0))"
+  # Share of Temperror whose cause is a DNS answer that could not be read
+  # (as opposed to a plain timeout).
+  - name: temperror_dns_garbled
+    expr: "(q.temperror_reasons | length) > 0 and
+           ('Ran off end of data' in q.temperror_reasons[0].key)"
+  - name: node_te_min
+    expr: "(q.nodes | map(attribute='te_pct') | min) if q.nodes else 0"
+  - name: node_te_max
+    expr: "(q.nodes | map(attribute='te_pct') | max) if q.nodes else 0"
+  - name: node_te_worst
+    expr: "(q.nodes | sort(attribute='te_pct', reverse=true) | first)
+           if q.nodes else None"
+  - name: shared_cause
+    expr: "(c.node_te_max - c.node_te_min) < params.node_spread_pts"
+  # Verdicts of accepted mail other than Pass: the unverified/weak share.
+  - name: accepted_not_pass
+    expr: "(q.accepted_by_verdict or [])
+           | rejectattr('key', 'equalto', 'Pass') | list"
+  - name: prev_reliable
+    expr: "(q.prev_total or 0) >= c.mf_total * params.prev_window_min_ratio
+           and (q.prev_total or 0) > 0"
+  - name: delta_verdicts
+    expr: "delta_pct(c.mf_total, q.prev_total) if c.prev_reliable else None"
+  - name: data_warning
+    expr: "None if c.prev_reliable or c.mf_total == 0 else
+           'Previous window logged only ' ~ human_int(q.prev_total) ~
+           ' verdicts against ' ~ human_int(c.mf_total) ~ ' now — trend
+           comparison suppressed (likely ingest gap).'"
+
+badges:
+  - id: coverage
+    label: "SPF verdict coverage"
+    levels:
+      - {when: "c.mf_total == 0", text: "NO DATA", color: grey}
+      - {when: "c.temperror_rate >= params.temperror_rate_crit",
+         text: IMPAIRED, color: red}
+      - {when: "c.temperror_rate >= params.temperror_rate_warn",
+         text: DEGRADED, color: amber}
+      - {text: COMPLETE, color: green}
+  - id: spoofing
+    label: "Institute-domain spoofing"
+    levels:
+      - {when: "c.screened == 0", text: "NO DATA", color: grey}
+      - {when: "c.own_accepted_bad > 0", text: EXPOSED, color: red}
+      - {when: "c.own_fail >= params.own_fail_watch",
+         text: SURGE, color: amber}
+      - {when: "c.own_fail > 0", text: "ALL REJECTED", color: green}
+      - {text: NONE, color: green}
+
+insights:
+  - when: "c.screened == 0"
+    stop: true
+    text: >
+      No SPF policy activity was recorded in the reporting window. Verify the
+      gateway log pipeline and that {{ ds.index }} is receiving documents.
+
+  - text: >
+      The SPF policy service screened {{ human_int(c.screened) }} messages
+      {%- if q.node_count %} on {{ human_int(q.node_count) }} gateway
+      node(s){% endif %}: {{ human_int(c.delivered) }} accepted with a
+      Received-SPF header, {{ human_int(c.rejected) }} rejected
+      {%- if c.skipped %} and {{ human_int(c.skipped) }} skipped
+      (whitelisted relays){% endif %}
+      {%- if c.delta_verdicts is not none %} (verdict volume
+      {{ "▲" if c.delta_verdicts > 0 else "▼" }}
+      {{ "%.1f" | format(c.delta_verdicts | abs) }}% vs previous
+      {{ window.hours }}h){% endif %}.
+
+  - when: "c.mf_total > 0"
+    text: >
+      Of {{ human_int(c.mf_total) }} sender-address verdicts,
+      {{ "%.1f" | format(c.pass_rate) }}% passed SPF and
+      {{ "%.1f" | format(c.temperror_rate) }}% could not be evaluated
+      (Temperror); the rest were
+      {{ human_int(q.none_total) }} with no SPF record published,
+      {{ human_int(q.softfail_total) }} SoftFail,
+      {{ human_int(q.neutral_total) }} Neutral,
+      {{ human_int(q.fail_total) }} Fail and
+      {{ human_int(q.permerror_total) }} PermError.
+
+  - when: "c.rejected > 0"
+    text: >
+      {{ human_int(c.rejected) }} messages were refused with SMTP 550:
+      {{ human_int(q.reject_fail_total) }} for an SPF Fail (5.7.23) and
+      {{ human_int(q.reject_perm_total) }} because the sender's own SPF
+      record is invalid (5.7.24)
+      {%- if c.reject_other %}, {{ human_int(c.reject_other) }} other{% endif %}.
+
+  - when: "c.accepted_not_pass"
+    text: >
+      Only Fail and PermError on the sender address are refused; every
+      other verdict is stamped into a Received-SPF header and accepted.
+      Accepted with a non-Pass verdict:
+      {% for r in c.accepted_not_pass %}{{ human_int(r.count) }} {{ r.key }}
+      {{- ", " if not loop.last }}{% endfor %}.
+
+  - when: "(q.own_checked or 0) > 0 and c.own_fail > 0"
+    text: >
+      {{ human_int(c.own_fail) }} messages claimed an institute address as
+      their sender but failed SPF
+      {%- if q.own_fail_source_count %}, from
+      {{ human_int(q.own_fail_source_count) }} source address(es)
+      {%- endif %}. {{ human_int(c.own_rejected) }} were rejected;
+      {% if c.own_accepted_bad == 0 %}none was accepted.
+      {%- else %}{{ human_int(c.own_accepted_bad) }} were ACCEPTED (see the
+      recommended actions).{% endif %}
+
+  - when: "(q.own_relay_probe or 0) > 0"
+    text: >
+      {{ human_int(q.own_relay_probe) }} of those spoofed messages were
+      addressed to recipients outside the institute (from
+      {{ human_int(q.own_relay_sources or 0) }} source address(es)) — relay /
+      backscatter probing rather than mail for a campus mailbox.
+      {%- if (q.own_relay_accepted or 0) == 0 %} None was accepted.
+      {%- else %} {{ human_int(q.own_relay_accepted) }} were accepted.{% endif %}
+
+  - when: "c.temperror > 0 and c.temperror_rate >= params.temperror_rate_warn"
+    text: >
+      {{ human_int(c.temperror) }} verdicts
+      ({{ "%.1f" | format(c.temperror_rate) }}%) ended in a temporary DNS
+      error, so SPF could not be checked;
+      {{ human_int(q.temperror_delivered) }} such messages were accepted
+      unverified. {% if q.temperror_networks %}The affected mail comes mostly
+      from {{ q.temperror_networks[:3] | map(attribute='key') | join(', ') }}.
+      {%- endif %}
+      {%- if c.shared_cause %} Every gateway node is affected to a similar
+      degree ({{ "%.0f" | format(c.node_te_min) }}–{{ "%.0f" | format(
+      c.node_te_max) }}%), so the cause is shared, not a single sick node.
+      {%- endif %}
+
+  - when: "(q.permerror_total or 0) > 0 and q.permerror_reasons"
+    text: >
+      {{ human_int(q.permerror_total) }} verdicts were PermError (the
+      sender's published SPF record is invalid); the commonest reason was
+      "{{ q.permerror_reasons[0].key | replace('SPF Permanent Error: ', '')
+      }}" ({{ human_int(q.permerror_reasons[0].count) }}).
+
+  - when: "q.fail_sources"
+    text: >
+      The source with most SPF failures was {{ q.fail_sources[0].key }}
+      ({{ q.fail_sources[0].location }}, {{ q.fail_sources[0].network }})
+      with {{ human_int(q.fail_sources[0].count) }} failed verdicts across
+      {{ human_int(q.fail_sources[0].senders) }} sender address(es).
+
+  - when: "q.hourly"
+    text: >
+      {% set peak = q.hourly | max(attribute='count') %}
+      Verdict volume peaked around {{ peak.label }} {{ window.tz_label }}
+      with {{ human_int(peak.count) }} in the hour.
+
+actions:
+  - when: "c.own_accepted_bad > 0"
+    priority: P1
+    owner: "Mail team + SOC"
+    text: >
+      {{ human_int(c.own_accepted_bad) }} message(s) claiming an institute
+      sender address failed SPF (Fail/SoftFail) and were ACCEPTED, from
+      {{ q.own_accepted_bad_sources | map(attribute='key') | join(', ') }}.
+      Find them in the mail logs by that source address, check whether the
+      source is an authorised relay missing from the institute's SPF record
+      (fix the record) or a forger (block it, notify the recipients).
+
+  - when: "c.temperror_rate >= params.temperror_rate_warn"
+    priority: P2
+    owner: "Mail team"
+    text: >
+      {{ "%.0f" | format(c.temperror_rate) }}% of sender verdicts
+      ({{ human_int(c.temperror) }}) could not be evaluated and the mail was
+      accepted unverified, so SPF protects only the remainder.
+      {%- if c.temperror_dns_garbled %} The recorded reason is
+      "{{ q.temperror_reasons[0].key }}"
+      ({{ human_int(q.temperror_reasons[0].count) }}): a DNS answer the SPF
+      library could not parse, typically a truncated or fragmented reply to
+      a large SPF TXT lookup.
+      {%- if c.shared_cause %} All nodes show the same rate, which points at
+      the resolver path they share rather than at any one node.
+      {%- elif c.node_te_worst %} {{ c.node_te_worst.key }} is the worst
+      affected ({{ "%.0f" | format(c.node_te_worst.te_pct) }}%), so start
+      there.{% endif %}
+      From a gateway node, repeat the lookup for an affected sender's SPF
+      record with plain UDP and with dig +tcp; if only the UDP
+      query fails, check that TCP/53 and EDNS UDP replies larger than 512
+      bytes (or fragments) pass between the nodes and their resolver, or
+      point the policy service at a local caching resolver.
+      {%- else %} Check DNS resolution from the gateway nodes (resolver
+      reachability and latency).{% endif %}
+
+  - when: "(q.permerror_total or 0) > 0 and
+           (q.reject_perm_total or 0) >= params.permerror_reject_min"
+    priority: P3
+    owner: "Mail team"
+    text: >
+      {{ human_int(q.reject_perm_total) }} messages were rejected only
+      because the sender's SPF record is invalid (5.7.24)
+      {%- if q.permerror_senders %}, led by
+      {{ q.permerror_senders[:3] | map(attribute='key') | join(', ') }}
+      {%- endif %}. That is a fault of the sender's DNS, not evidence of
+      forgery, so legitimate senders lose mail. Review the senders in the
+      table below; if the loss is unwanted, set PermError_reject to False in
+      policyd-spf.conf (such mail is then accepted with a Received-SPF:
+      PermError header, like Softfail).
+
+  - when: "q.fail_sources and q.fail_sources[0].count >= params.fail_source_min"
+    priority: P3
+    owner: "SOC"
+    text: >
+      {% set heavy = q.fail_sources | selectattr('count', 'ge',
+         params.fail_source_min) | list %}
+      {{ heavy | length }} source address(es) each caused at least
+      {{ params.fail_source_min }} SPF-failed attempts
+      ({{ heavy[:3] | map(attribute='key') | join(', ') }}). The messages
+      are already rejected. If they are not senders you expect, block the
+      addresses at the edge (MTA client restrictions or fail2ban) instead of
+      rejecting message by message.
+
+sections:
+  - {type: heading, title: "Executive summary"}
+  - {type: insights}
+
+  - type: kpi_row
+    items:
+      - {label: "Messages screened", value: "c.screened", format: int,
+         delta: "c.delta_verdicts"}
+      - {label: "Accepted", value: "c.delivered", format: int}
+      - {label: "Rejected (550)", value: "c.rejected", format: int,
+         foot: "{{ '%.1f' | format(pct(c.rejected, c.screened)) }}% of messages"}
+      - {label: "SPF not evaluable", value: "c.temperror", format: int,
+         style: "'crit' if c.temperror_rate >= params.temperror_rate_crit else
+                 ('warn' if c.temperror_rate >= params.temperror_rate_warn
+                 else 'ok')",
+         foot: "{{ '%.1f' | format(c.temperror_rate) }}% of verdicts"}
+      - {label: "Institute spoofing", value: "c.own_fail", format: int,
+         style: "'crit' if c.own_accepted_bad > 0 else
+                 ('warn' if c.own_fail >= params.own_fail_watch else 'ok')",
+         foot: "{{ human_int(c.own_rejected) }} rejected"}
+
+  - {type: heading, title: "Screening volume"}
+  - type: timeseries
+    title: "Sender verdicts per hour"
+    query: hourly
+    overlay: hourly_rejected
+    series_label: "verdicts / hour"
+    overlay_label: "rejected"
+
+  - type: row
+    left:
+      type: donut
+      title: "Sender verdicts"
+      center_label: "verdicts"
+      slices:
+        - {label: "Pass", expr: "q.pass_total or 0", color: green}
+        - {label: "Temperror (not evaluable)", expr: "c.temperror", color: red}
+        - {label: "No SPF record", expr: "q.none_total or 0", color: grey}
+        - {label: "Softfail / Neutral",
+           expr: "(q.softfail_total or 0) + (q.neutral_total or 0)",
+           color: amber}
+        - {label: "Fail", expr: "c.fail", color: navy}
+        - {label: "PermError", expr: "q.permerror_total or 0", color: purple}
+    right:
+      type: bars
+      title: "Accepted mail by verdict"
+      query: accepted_by_verdict
+      color: sky
+      show_pct: true
+
+  - {type: heading, title: "Enforcement"}
+  - type: row
+    left:
+      type: table
+      title: "Rejections by reason"
+      query: reject_status
+      hide_if_empty: true
+      note: "5.7.23 = SPF Fail (the sending address is not authorised by the
+             domain's own policy). 5.7.24 = SPF PermError (the SENDER'S SPF
+             record is invalid - a sender fault, not proof of forgery)."
+      columns:
+        - {key: key, label: "SMTP status", format: mono}
+        - {key: count, label: "Messages", format: int}
+    right:
+      type: table
+      title: "Rejections per gateway node"
+      query: node_rejects
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Node", format: mono}
+        - {key: count, label: "Messages", format: int}
+
+  - type: table
+    title: "Recipients targeted by rejected mail"
+    query: rejected_recipients
+    hide_if_empty: true
+    note: "Recipients of messages the gateway refused. A few recipients
+           hit repeatedly are being targeted; the same recipient across many
+           sources is usually a harvested address."
+    columns:
+      - {key: key, label: "Recipient", format: mono, max: 44}
+      - {key: count, label: "Rejected", format: int}
+      - {key: sources, label: "Sources", format: int}
+
+  - {type: heading, title: "Spoofing of the institute's own addresses"}
+  - type: table
+    title: "Sources that claimed an institute sender and failed SPF"
+    query: own_fail_sources
+    hide_if_empty: true
+    note: "Mail whose envelope sender is an institute address but whose
+           connecting host is not authorised by the institute's SPF record.
+           'Outside' counts messages addressed to non-institute recipients
+           (relay / backscatter probing)."
+    columns:
+      - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: location, label: "Location", max: 22}
+      - {key: network, label: "Network", max: 30}
+      - {key: count, label: "Failed", format: int}
+      - {key: senders, label: "Addresses forged", format: int}
+      - {key: outside, label: "To outside", format: int}
+
+  - type: bars
+    title: "Networks that legitimately send as the institute (SPF Pass)"
+    query: own_pass_networks
+    hide_if_empty: true
+    color: green
+
+  - {type: heading, title: "Sources and senders failing SPF"}
+  - type: table
+    title: "Sources with most SPF failures"
+    query: fail_sources
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Source IP", format: mono, width: 110, nowrap: true}
+      - {key: scope, label: "Class", format: pill,
+         pill_map: {INTERNAL: ok, BOT: grey, EXTERNAL: warn}}
+      - {key: location, label: "Location", max: 22}
+      - {key: network, label: "Network", max: 30}
+      - {key: count, label: "Failed", format: int}
+      - {key: senders, label: "Senders", format: int}
+      - {key: recipients, label: "Recipients", format: int}
+
+  - type: row
+    left:
+      type: table
+      title: "Sender addresses failing SPF"
+      query: fail_senders
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Sender", format: mono, max: 34}
+        - {key: count, label: "Failed", format: int}
+        - {key: sources, label: "Sources", format: int}
+    right:
+      type: bars
+      title: "SPF failures by source country"
+      query: fail_countries
+      color: navy
+
+  - type: table
+    title: "Sender domains failing SPF"
+    query: fail_domains
+    skip_if_unmapped: [sender_domain]
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Domain", format: mono, max: 40}
+      - {key: count, label: "Failed", format: int}
+      - {key: sources, label: "Sources", format: int}
+
+  - {type: heading, title: "Verdict gaps: SPF that could not be evaluated"}
+  - type: timeseries
+    title: "Temperror verdicts per hour"
+    query: hourly_temperror
+    color: red
+    series_label: "unevaluable verdicts / hour"
+    note: "A flat share of the hourly volume means a deterministic cause (the
+           same senders every time); spikes mean resolver trouble."
+
+  - type: table
+    title: "Why SPF could not be evaluated (Temperror)"
+    query: temperror_reasons
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Reason reported by the SPF library", max: 70}
+      - {key: count, label: "Verdicts", format: int}
+
+  - type: table
+    title: "Networks behind the unevaluable mail"
+    query: temperror_networks
+    hide_if_empty: true
+    note: "Mail from these networks was accepted without an SPF verdict."
+    columns:
+      - {key: key, label: "Network", max: 40}
+      - {key: count, label: "Verdicts", format: int}
+      - {key: sources, label: "Sources", format: int}
+      - {key: recipients, label: "Recipients", format: int}
+
+  - type: table
+    title: "Sender domains that could not be evaluated"
+    query: temperror_domains
+    skip_if_unmapped: [sender_domain]
+    hide_if_empty: true
+    columns:
+      - {key: key, label: "Domain", format: mono, max: 40}
+      - {key: count, label: "Verdicts", format: int}
+      - {key: sources, label: "Sources", format: int}
+
+  - type: row
+    left:
+      type: table
+      title: "Invalid sender SPF records (PermError)"
+      query: permerror_reasons
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Reason", max: 56}
+        - {key: count, label: "Verdicts", format: int}
+    right:
+      type: table
+      title: "Senders rejected for an invalid SPF record"
+      query: permerror_senders
+      hide_if_empty: true
+      columns:
+        - {key: key, label: "Sender", format: mono, max: 30}
+        - {key: count, label: "Rejected", format: int}
+        - {key: recipients, label: "Recipients", format: int}
+
+  - {type: heading, title: "Gateway nodes"}
+  - type: table
+    title: "Verdicts per gateway node"
+    query: nodes
+    hide_if_empty: true
+    note: "Similar Temperror rates on every node point at a shared cause
+           (the resolver path); one outlier points at that node."
+    columns:
+      - {key: key, label: "Node", format: mono}
+      - {key: count, label: "Verdicts", format: int}
+      - {key: temperror, label: "Temperror", format: int}
+      - {key: te_pct, label: "Temperror %", format: pct}
+      - {key: failed, label: "SPF Fail", format: int}
+
+  - type: table
+    title: "SPF not evaluated (whitelisted relays)"
+    query: skipped_networks
+    hide_if_empty: true
+    note: "Relays matched by the policy service's whitelist skip the SPF
+           check entirely (Domain_Whitelist / Domain_Whitelist_PTR in
+           policyd-spf.conf). Review the list if this table grows."
+    columns:
+      - {key: key, label: "Network", max: 30}
+      - {key: count, label: "Messages", format: int}
+      - {key: helo, label: "Typical HELO", format: mono, max: 36}
+      - {key: reason, label: "Rule", max: 44}
+
+  - {type: heading, title: "Recommended actions"}
+  - {type: actions}

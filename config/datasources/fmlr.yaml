@@ -1,0 +1,63 @@
+# ===========================================================================
+# Datasource: FMLR mail gateways - python-policyd-spf (parsed by
+# foss-soc-engine, module fmlr).
+#
+# The gateways (fmlr1..N) run the SPF policy service in front of the mail
+# relays. One SMTP transaction produces several log lines, told apart by
+# event.action; the report counts each fact from exactly ONE of them so
+# nothing is tripled:
+#
+#   spf_check         one verdict per evaluated identity (identity is
+#                     "mailfrom" or "helo"; "no SPF record" marks a HELO
+#                     name that publishes no SPF). The report's verdicts
+#                     come from identity=mailfrom.
+#   spf_header_added  the message was accepted and stamped with a
+#                     Received-SPF header (one per accepted message).
+#   spf_reject        the message was refused (SMTP 550; 5.7.23 = SPF Fail,
+#                     5.7.24 = SPF PermError).
+#   spf_skipped       SPF not evaluated: whitelisted relay domain.
+#   spf_debug         the raw pyspf result line - repeats spf_check, but is
+#                     the only line that carries spf.explanation (the
+#                     reason behind a Temperror / Permerror).
+#
+# The logical field names below are what the report is written against.
+# ===========================================================================
+name: fmlr
+label: "Mail Gateways (SPF policy service)"
+profile: spf_gateway
+index: "fosstlsoc-logs-fmlr*"
+
+fields:
+  timestamp: "@timestamp"
+  action: "event.action.keyword"
+  node: "host.name.keyword"                     # fmlr1 ... fmlrN
+  sender: "email.from.address.keyword"          # SMTP envelope sender
+  recipient: "email.to.address.keyword"
+  client_ip: "source.ip"                        # connecting MTA
+  geo_country: "source.geo.country_name"        # keyword, NO .keyword
+  geo_city: "source.geo.city_name"
+  asn_org: "source.as.organization.name.keyword"
+  spf_result: "spf.result.keyword"              # Pass / Fail / Softfail / ...
+  spf_identity: "spf.identity.keyword"          # mailfrom | helo | no SPF record
+  spf_scope: "spf.scope.keyword"                # helo | mailfrom (debug/header lines)
+  spf_helo: "spf.helo.keyword"
+  # Why a verdict is Temperror / Permerror. Present on spf_debug lines only.
+  spf_explanation: "spf.explanation.keyword"
+  spf_status: "spf.smtp_status.keyword"         # enhanced status on rejects
+  spf_code: "spf.smtp_code"
+  reason: "event.reason.keyword"                # why SPF was skipped
+
+# NOT indexed on this estate: the sender's domain. The domain only exists
+# inside email.from.address, and the framework cannot split strings at query
+# time, so "which sender domain" tables (domains that never get a verdict,
+# domains that fail SPF) are omitted. Once the parsing engine adds a domain
+# field (the postfix module already emits email.sender_domain), uncomment:
+#     sender_domain: "email.sender_domain.keyword"
+# and re-run:   python3 -m framework check-fields --datasource fmlr
+
+params:
+  # The institute's own addresses (wildcards over the full address, matched
+  # case-insensitively). Mail that CLAIMS one of these as its envelope
+  # sender but fails SPF is spoofing of the institute's identity - the
+  # report's highest-value finding.
+  own_address_patterns: ["*@iitb.ac.in", "*.iitb.ac.in"]
